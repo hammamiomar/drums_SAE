@@ -1,0 +1,67 @@
+[project]
+name = "drums-sae"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "diffusers>=0.35.2",
+    "einops>=0.8.0",
+    "einops-exts>=0.0.4",
+    "huggingface-hub>=0.36.0",
+    "ipykernel>=7.1.0",
+    "jupyter>=1.1.1",
+    "librosa>=0.11.0",
+    "matplotlib>=3.8.0",
+    "notebook>=7.4.7",
+    "pandas",
+    "numpy>=2.3.4",
+    "safetensors>=0.6.2",
+    "scipy>=1.11.0",
+    "seaborn>=0.13.0",
+    "soundfile>=0.12.0",
+    "stable-audio-tools",
+    "torch>=2.9.0",
+    "torchaudio>=2.9.0",
+    "torchcodec>=0.8.1",
+    "tqdm>=4.67.1",
+    "transformers>=4.57.1",
+    "k-diffusion>=0.0.16",
+    "alias-free-torch>=0.0.6",
+]
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.34.0",
+    "ipython>=9.7.0",
+    "mypy>=1.18.2",
+    "pyright>=1.1.407",
+    "pytest>=9.0.1",
+    "pytest-dotenv>=0.5.2",
+    "ruff>=0.14.5",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src","stable-audio-tools"]
+
+[tool.uv.sources]
+stable-audio-tools = { path = "stable-audio-tools", editable = true }
+
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+env_files = [".env"]
+addopts = "-v"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: tests that load real models or files"
+]
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+extraPaths = ["src", "stable-audio-tools"]
+typeCheckingMode = "basic"
