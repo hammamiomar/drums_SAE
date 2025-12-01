@@ -28,6 +28,7 @@ dependencies = [
     "transformers>=4.57.1",
     "k-diffusion>=0.0.16",
     "alias-free-torch>=0.0.6",
+    "wandb>=0.23.0",
 ]
 
 [dependency-groups]

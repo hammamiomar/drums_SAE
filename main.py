@@ -1,4 +1,4 @@
-from drums_SAE.dataset_prepare import create_dataset_manifest, encode_audio
+from drums_SAE.training.pre_encode_dataset import create_dataset_manifest, encode_audio
 
 if __name__ == "__main__":
     create_dataset_manifest(root_path="data", output_path="data/GT/drums_manifest.csv")

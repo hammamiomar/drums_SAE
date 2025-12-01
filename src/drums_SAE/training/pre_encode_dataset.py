@@ -153,16 +153,3 @@ def encode_audio(
     )
 
     print("Done.")
-
-
-def load_data(path="processed_dataset.npz"):
-    # Load the archive
-    data = np.load(path)
-
-    # Access arrays by the names we gave them in savez_compressed
-    latents = data["latents"]  # The big training data
-    mean = data["mean"]  # For normalization
-    std = data["std"]  # For normalization
-
-    print(f"Loaded latents: {latents.shape}")
-    return latents, mean, std

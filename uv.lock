@@ -618,6 +618,7 @@ dependencies = [
     { name = "torchcodec" },
     { name = "tqdm" },
     { name = "transformers" },
+    { name = "wandb" },
 ]
 
 [package.dev-dependencies]
@@ -656,6 +657,7 @@ requires-dist = [
     { name = "torchcodec", specifier = ">=0.8.1" },
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "transformers", specifier = ">=4.57.1" },
+    { name = "wandb", specifier = ">=0.23.0" },
 ]
 
 [package.metadata.requires-dev]

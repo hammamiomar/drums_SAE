@@ -12,3 +12,5 @@ data/*
 weights/*
 .zed/*
 .DS_Store
+checkpoints
+wandb
