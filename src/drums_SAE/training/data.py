@@ -15,7 +15,7 @@ class LatentDataset(Dataset):
         self.mean = torch.from_numpy(data["mean"]).float()  # (64, )
         self.std = torch.from_numpy(data["std"]).float()  # (64, )
 
-        if normalize:
+        if normalize:  # normalizing, channel wise, like for each of the 64 columns
             self.latents = (latents - self.mean) / (self.std + 1e-8)
         else:
             self.latents = latents
