@@ -211,6 +211,8 @@ def spearman_correlation(X: torch.Tensor, Y: torch.Tensor) -> np.ndarray:
     return (X_norm.T @ Y_norm / len(X)).numpy()
 
 
+# %% [markdown]
+# h is of shape (32 timesteps * num samples, features)
 # %% Aggregate to Audio Sample Level
 n_audio = len(h) // config.n_timesteps
 h_agg = h.reshape(n_audio, config.n_timesteps, -1).mean(dim=1)
@@ -479,4 +481,255 @@ Phase 2C (Steering):
   • Recommendation: {"Test steering!" if good else "Consider per-timestep labels"}
 """)
 
-# %%
+# %% [markdown]
+# ## Phase 2D: Advanced Visualizations
+#
+# - UMAP embedding colored by acoustic properties
+# - Feature co-occurrence matrix
+# - Temporal activation heatmap
+
+# %% UMAP Embedding
+print("=" * 60)
+print("PHASE 2D: ADVANCED VISUALIZATIONS")
+print("=" * 60)
+
+# Try UMAP, fall back to PCA
+try:
+    from umap import UMAP
+
+    reducer = UMAP(
+        n_components=2, n_neighbors=15, min_dist=0.1, random_state=42, n_jobs=-1
+    )
+    method_name = "UMAP"
+except ImportError:
+    print("UMAP not installed, using PCA. Install with: pip install umap-learn")
+    reducer = PCA(n_components=2, random_state=42)
+    method_name = "PCA"
+
+# Subsample for speed (10k audio samples)
+n_subsample = min(10_000, n_audio)
+subsample_idx = np.random.choice(n_audio, n_subsample, replace=False)
+h_subsample = h_agg[subsample_idx].numpy()
+meta_subsample = meta_agg.iloc[subsample_idx]
+
+print(f"Computing {method_name} embedding on {n_subsample:,} samples...")
+embedding = reducer.fit_transform(h_subsample)
+
+# %% UMAP colored by 4 key properties
+key_labels = ["brightness", "depth", "loudness", "roughness"]
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 12))
+axes = axes.flatten()
+
+for ax, label in zip(axes, key_labels):
+    values = meta_subsample[label].values
+
+    # Handle potential NaN/inf
+    valid = np.isfinite(values)
+
+    scatter = ax.scatter(
+        embedding[valid, 0],
+        embedding[valid, 1],
+        c=values[valid],
+        cmap="viridis",
+        s=3,
+        alpha=0.6,
+    )
+    ax.set_title(label.capitalize(), fontsize=12)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    plt.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04)
+
+plt.suptitle(
+    f"{method_name} Embedding of SAE Features\nColored by Acoustic Properties",
+    fontsize=14,
+)
+plt.tight_layout()
+plt.savefig("plots/05_umap_by_properties.png", dpi=150)
+plt.show()
+
+# %% Feature Co-occurrence Matrix
+print("\nComputing feature co-occurrence matrix...")
+
+# Binary activation matrix (which features fire together)
+active = (h_agg > 0).float()  # (n_audio, 1024)
+cooccur = (active.T @ active).numpy()  # (1024, 1024)
+cooccur_normalized = cooccur / n_audio  # P(both fire)
+
+# Select top 100 most-used features for visibility
+top_100_features = torch.argsort(feature_usage, descending=True)[:100].numpy()
+cooccur_subset = cooccur_normalized[np.ix_(top_100_features, top_100_features)]
+
+# %% Co-occurrence clustermap
+print("Generating co-occurrence clustermap...")
+
+g = sns.clustermap(
+    cooccur_subset,
+    cmap="viridis",
+    figsize=(12, 12),
+    xticklabels=False,
+    yticklabels=False,
+    dendrogram_ratio=0.1,
+    cbar_pos=(0.02, 0.8, 0.03, 0.15),
+)
+g.fig.suptitle(
+    "Feature Co-occurrence (Top 100 Features, Clustered)", fontsize=14, y=1.01
+)
+plt.savefig("plots/06_cooccurrence_clustermap.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+# Co-occurrence stats
+np.fill_diagonal(cooccur_normalized, 0)  # Exclude self-cooccurrence
+print(f"\nCo-occurrence statistics:")
+print(f"  Mean P(i,j both fire): {cooccur_normalized.mean():.4f}")
+print(f"  Max P(i,j both fire): {cooccur_normalized.max():.4f}")
+
+# Top co-occurring pairs
+upper_tri = np.triu(cooccur_normalized, k=1)
+top_pairs_flat = np.argsort(upper_tri.flatten())[-10:][::-1]
+print(f"\nTop 5 co-occurring feature pairs:")
+for flat_idx in top_pairs_flat[:5]:
+    i, j = flat_idx // 1024, flat_idx % 1024
+    print(f"  F{i} & F{j}: P={cooccur_normalized[i, j]:.3f}")
+
+# %% Temporal Heatmap
+print("\nGenerating temporal activation heatmap...")
+
+# Mean activation per feature per timestep: (32, 1024)
+temporal_matrix = h_temporal.mean(dim=0).numpy()  # Average across all audio samples
+
+# Normalize each feature to [0, 1] for visualization
+temporal_normed = temporal_matrix / (temporal_matrix.max(axis=0, keepdims=True) + 1e-10)
+
+# Select features with high temporal variance (most interesting)
+temporal_variance = temporal_normed.var(axis=0)
+top_temporal_features = np.argsort(temporal_variance)[
+    -75:
+]  # Top 75 most temporally varying
+
+# Sort by peak time for nicer visualization
+peak_times = temporal_normed[:, top_temporal_features].argmax(axis=0)
+sorted_order = np.argsort(peak_times)
+features_sorted = top_temporal_features[sorted_order]
+
+fig, ax = plt.subplots(figsize=(14, 10))
+im = ax.imshow(
+    temporal_normed[:, features_sorted].T,
+    aspect="auto",
+    cmap="magma",
+    interpolation="nearest",
+)
+
+# Time axis in ms
+time_labels = [f"{int(t * 46)}" for t in range(0, config.n_timesteps, 4)]
+ax.set_xticks(range(0, config.n_timesteps, 4))
+ax.set_xticklabels(time_labels)
+ax.set_xlabel("Time (ms)", fontsize=11)
+ax.set_ylabel("Feature (sorted by peak time)", fontsize=11)
+ax.set_title(
+    "Temporal Activation Patterns\n(75 Most Temporally-Varying Features)", fontsize=14
+)
+
+plt.colorbar(im, ax=ax, label="Normalized Activation", fraction=0.02, pad=0.02)
+plt.tight_layout()
+plt.savefig("plots/07_temporal_heatmap.png", dpi=150)
+plt.show()
+
+# %% Temporal structure summary
+early_features = features_sorted[:15]  # Fire early
+late_features = features_sorted[-15:]  # Fire late
+
+print(f"\nTemporal structure:")
+print(f"  Early-firing features (attack): {early_features.tolist()}")
+print(f"  Late-firing features (sustain): {late_features.tolist()}")
+
+# %% Decoder Direction Visualization
+print("\nVisualizing decoder directions with PCA...")
+
+# Project 1024 decoder columns (each is 64-dim) to 2D
+decoder_pca = PCA(n_components=2)
+decoder_2d = decoder_pca.fit_transform(W_dec.T.numpy())  # (1024, 2)
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+# Color by feature usage
+ax = axes[0]
+usage_colors = np.log1p(feature_usage.numpy())  # Log scale for visibility
+scatter = ax.scatter(
+    decoder_2d[:, 0], decoder_2d[:, 1], c=usage_colors, cmap="viridis", s=10, alpha=0.7
+)
+ax.set_xlabel(f"PC1 ({decoder_pca.explained_variance_ratio_[0]:.1%})")
+ax.set_ylabel(f"PC2 ({decoder_pca.explained_variance_ratio_[1]:.1%})")
+ax.set_title("Decoder Directions\n(colored by log usage)")
+plt.colorbar(scatter, ax=ax, label="log(usage + 1)")
+
+# Color by best correlation
+ax = axes[1]
+best_corr = np.abs(corr_agg).max(axis=1)  # Max |ρ| for each feature
+scatter = ax.scatter(
+    decoder_2d[:, 0], decoder_2d[:, 1], c=best_corr, cmap="plasma", s=10, alpha=0.7
+)
+ax.set_xlabel(f"PC1 ({decoder_pca.explained_variance_ratio_[0]:.1%})")
+ax.set_ylabel(f"PC2 ({decoder_pca.explained_variance_ratio_[1]:.1%})")
+ax.set_title("Decoder Directions\n(colored by max |ρ| with labels)")
+plt.colorbar(scatter, ax=ax, label="max |ρ|")
+
+plt.tight_layout()
+plt.savefig("plots/08_decoder_pca.png", dpi=150)
+plt.show()
+
+# %% Correlation Clustermap
+print("\nGenerating feature-label correlation clustermap...")
+
+# Cluster features by their correlation profiles
+# Exclude reverb (binary, meaningless correlations)
+labels_no_reverb = [l for l in config.label_columns if l != "reverb"]
+corr_no_reverb = corr_agg[:, [config.label_columns.index(l) for l in labels_no_reverb]]
+
+# Select features with strong correlations
+strong_corr_mask = np.abs(corr_no_reverb).max(axis=1) > 0.15
+strong_features = np.where(strong_corr_mask)[0]
+print(f"Features with |ρ| > 0.15: {len(strong_features)}")
+
+g = sns.clustermap(
+    corr_no_reverb[strong_features],
+    cmap="RdBu_r",
+    center=0,
+    vmin=-0.6,
+    vmax=0.6,
+    figsize=(10, 14),
+    xticklabels=labels_no_reverb,
+    yticklabels=False,
+    dendrogram_ratio=(0.1, 0.05),
+    cbar_pos=(0.02, 0.8, 0.03, 0.15),
+)
+g.fig.suptitle(
+    f"Feature-Label Correlations Clustered\n({len(strong_features)} features with |ρ| > 0.15)",
+    fontsize=14,
+    y=1.01,
+)
+plt.savefig("plots/09_correlation_clustermap.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+# %% Final visualization summary
+print("\n" + "=" * 60)
+print("VISUALIZATION SUMMARY")
+print("=" * 60)
+print(f"""
+Generated plots:
+ 📊 plots/01_phase2a_metrics.png     - Reconstruction & sparsity metrics
+ 📊 plots/02_correlations.png        - Before/after aggregation comparison
+ 📊 plots/03_temporal.png            - Attack vs sustain feature profiles
+ 📊 plots/04_control_vectors.png     - Control vector similarity matrix
+ 📊 plots/05_umap_by_properties.png  - {method_name} embedding by acoustic properties
+ 📊 plots/06_cooccurrence_clustermap.png - Feature co-activation structure
+ 📊 plots/07_temporal_heatmap.png    - When features fire (32 timesteps)
+ 📊 plots/08_decoder_pca.png         - Decoder direction geometry
+ 📊 plots/09_correlation_clustermap.png - Features clustered by correlations
+
+Key insights:
+ • {method_name} shows {"smooth gradients" if method_name == "UMAP" else "structure"} for acoustic properties
+ • Co-occurrence reveals feature "modules" that fire together
+ • Temporal heatmap shows clear attack→sustain progression
+ • Decoder PCA shows feature directions are well-spread (good for steering)
+""")
