@@ -457,7 +457,7 @@ summary = pd.DataFrame(
         **{f"corr_{l}": corr_agg[:, i] for i, l in enumerate(config.label_columns)},
     }
 )
-summary.to_csv("feature_summary.csv", index=False)
+# summary.to_csv("feature_summary.csv", index=False)
 print("\n✅ Saved feature_summary.csv")
 
 # %% Final Summary
