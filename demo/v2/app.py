@@ -252,24 +252,28 @@ def generate_steering_triplet(
     models: dict,
     sample_idx: int,
     feature_idx: int,
-    steering_value: float,
+    scale: float,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """
-    Generate original, +steered, and -steered audio for a sample.
+    Generate original, +steered (amplified), and -steered (reduced) audio.
 
-    Uses steer_with_residual() to preserve audio quality.
+    Uses steer_with_residual() with relative scaling for proper RMSNorm handling.
+    The +/- directions are symmetric in multiplicative space:
+        +Steered: scale (e.g., 2.0 = double the feature)
+        -Steered: 1/scale (e.g., 0.5 = halve the feature)
     """
     z_orig = get_sample_latents(models, sample_idx)
 
     # Original
     audio_orig = decode_to_audio(z_orig, models)
 
-    # +Steered
-    z_plus = steer_with_residual(z_orig, models["sae"], feature_idx, steering_value)
+    # +Steered (amplify feature)
+    z_plus = steer_with_residual(z_orig, models["sae"], feature_idx, scale)
     audio_plus = decode_to_audio(z_plus, models)
 
-    # -Steered
-    z_minus = steer_with_residual(z_orig, models["sae"], feature_idx, -steering_value)
+    # -Steered (reduce feature) - use reciprocal for symmetric behavior
+    scale_minus = 1.0 / scale if scale > 0 else 0.0
+    z_minus = steer_with_residual(z_orig, models["sae"], feature_idx, scale_minus)
     audio_minus = decode_to_audio(z_minus, models)
 
     return audio_orig, audio_plus, audio_minus
@@ -350,14 +354,14 @@ def build_steering_ui(models: dict, tab_label: str) -> None:
                 maximum=n_features - 1,
             )
 
-            # Steering value
+            # Steering scale factor
             steering_slider = gr.Slider(
-                minimum=0.1,
-                maximum=2.0,
-                value=0.5,
-                step=0.1,
-                label="STEERING MAGNITUDE",
-                info="Applied as +value and -value",
+                minimum=0.5,
+                maximum=4.0,
+                value=2.0,
+                step=0.25,
+                label="STEERING SCALE",
+                info="1.0=unchanged, 2.0=double, 4.0=quadruple. -Steered uses 1/scale.",
             )
 
         with gr.Column(scale=1):
@@ -401,12 +405,12 @@ def build_steering_ui(models: dict, tab_label: str) -> None:
                 interactive=False,
             )
             plus_audio = gr.Audio(
-                label="+Steered",
+                label="Amplified (+)",
                 type="numpy",
                 interactive=False,
             )
             minus_audio = gr.Audio(
-                label="-Steered",
+                label="Reduced (-)",
                 type="numpy",
                 interactive=False,
             )

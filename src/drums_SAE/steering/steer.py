@@ -9,7 +9,9 @@ Usage:
     z_steered = steer_latent(z, cv["brightness"], alpha=0.5)
 
     # Direct feature manipulation with residual preservation (Gytis trick)
-    z_steered = steer_with_residual(z, sae, feature_idx=1852, value=1.0)
+    # Uses relative scaling: 0=suppress, 1=unchanged, 2=double, -1=invert
+    z_steered = steer_with_residual(z, sae, feature_idx=1852, scale=2.0)  # Double feature 1852
+    z_steered = steer_with_residual(z, sae, feature_idx=1852, scale=0.0)  # Suppress feature 1852
 """
 
 from dataclasses import dataclass
@@ -31,21 +33,24 @@ def steer_with_residual(
     z: torch.Tensor,
     sae: AudioSae,
     feature_idx: int,
-    value: float,
+    scale: float = 1.0,
 ) -> torch.Tensor:
     """
     Steer a latent while preserving reconstruction residual (Gytis trick).
 
-    The SAE can't perfectly reconstruct (R² < 1.0). Without the residual,
-    every steering operation loses ~6% of the signal, washing out fine details.
-    By computing the residual BEFORE modification and adding it back AFTER,
-    we preserve exactly what the SAE couldn't represent.
+    Uses relative scaling to modify features while maintaining the RMSNorm
+    constraint that the decoder was trained on. The residual trick preserves
+    information the SAE couldn't represent (~6% of signal).
 
     Args:
         z: Normalized latent tensor, shape (n_timesteps, 64) or (batch, n_timesteps, 64)
         sae: Trained SAE model (will be set to inference mode)
         feature_idx: Which SAE feature to manipulate (0 to d_hidden-1)
-        value: Target activation value (0 = suppress, positive = enhance)
+        scale: Relative scaling factor for the feature activation:
+            - 0.0 = suppress (set to zero)
+            - 1.0 = unchanged
+            - 2.0 = double the activation
+            - negative values invert the feature direction
 
     Returns:
         Steered latent with residual preserved, same shape as input
@@ -62,9 +67,13 @@ def steer_with_residual(
         z_reconstructed = sae.decode(f)
         residual = z - z_reconstructed
 
-        # Modify the target feature
+        # Scale the target feature relative to its current value
         f_modified = f.clone()
-        f_modified[..., feature_idx] = value
+        f_modified[..., feature_idx] = f[..., feature_idx] * scale
+
+        # Re-normalize to maintain unit hypersphere constraint
+        # This is critical: the decoder was trained on RMSNorm-normalized inputs
+        f_modified = sae.rms_norm(f_modified)
 
         # Decode and add residual back — preserving fine details
         z_steered = sae.decode(f_modified) + residual
@@ -76,7 +85,7 @@ def steer_with_residual(
 def steer_multi_features_with_residual(
     z: torch.Tensor,
     sae: AudioSae,
-    feature_modifications: dict[int, float],
+    feature_scales: dict[int, float],
 ) -> torch.Tensor:
     """
     Steer multiple features at once while preserving residual.
@@ -87,7 +96,8 @@ def steer_multi_features_with_residual(
     Args:
         z: Normalized latent tensor, shape (n_timesteps, 64) or (batch, n_timesteps, 64)
         sae: Trained SAE model
-        feature_modifications: Dict mapping feature_idx -> target_value
+        feature_scales: Dict mapping feature_idx -> scale factor
+            (0.0 = suppress, 1.0 = unchanged, 2.0 = double)
 
     Returns:
         Steered latent with all modifications applied
@@ -102,9 +112,13 @@ def steer_multi_features_with_residual(
         z_reconstructed = sae.decode(f)
         residual = z - z_reconstructed
 
+        # Scale each feature relative to its current value
         f_modified = f.clone()
-        for feature_idx, value in feature_modifications.items():
-            f_modified[..., feature_idx] = value
+        for feature_idx, scale in feature_scales.items():
+            f_modified[..., feature_idx] = f[..., feature_idx] * scale
+
+        # Re-normalize to maintain unit hypersphere constraint
+        f_modified = sae.rms_norm(f_modified)
 
         z_steered = sae.decode(f_modified) + residual
 
