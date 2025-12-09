@@ -6,35 +6,47 @@ import wandb
 from tqdm import tqdm
 
 from drums_SAE.sae.model import AudioSae, compute_metrics, sae_loss
-from drums_SAE.training.data import create_dataloader, infinite_dataloader
+from drums_SAE.training.data import (
+    create_dataloader,
+    create_dataloader_v2,
+    infinite_dataloader,
+)
 
 
 @dataclass
 class TrainConfig:
-    # Data
-    data_path: str = "data/drums_encoded.npz"
+    """Training configuration for SAE.
 
-    # Model
+    v2 defaults: Larger model (4096 features), sparser activations (topk=32),
+    and silence filtering to focus on meaningful audio content.
+    """
+
+    # Data (v2: aligned latents + features with silence filtering)
+    data_path: str = "data/latents_v2.npz"
+    features_path: str | None = "data/features_v2.csv"
+    filter_silence: bool = True
+
+    # Model (v2: 4× larger, sparser)
     d_input: int = 64
-    expansion_factor: int = 16
-    topk: int = 64
-    topk_aux: int = 128
+    expansion_factor: int = 64  # 64 × 64 = 4096 features (v1 was 16 → 1024)
+    topk: int = 32  # Sparser activations (v1 was 64)
+    topk_aux: int = 512  # More dead feature revival capacity
     dead_threshold: int = 10_000
 
     # Training
-    batch_size: int = 256
+    batch_size: int = 4096  # Larger batches for smaller filtered dataset
     lr: float = 1e-4
-    num_steps: int = 50_000
+    num_steps: int = 100_000  # More training steps (v1 was 50,000)
     auxk_coef: float = 1 / 32
 
     # Logging & Checkpoints
     log_every: int = 100
-    save_every: int = 5_000
-    checkpoint_dir: str = "checkpoints"
+    save_every: int = 10_000
+    checkpoint_dir: str = "experiments/v2_main/checkpoints"
 
     # W&B
     wandb_project: str = "drums_SAE"
-    wandb_name: str | None = None  # auto-generated if None
+    wandb_name: str | None = None
 
 
 def get_device() -> str:
@@ -46,23 +58,40 @@ def get_device() -> str:
 
 
 def train(config: TrainConfig):
-    """Main training loop."""
+    """Main training loop for SAE.
 
+    Supports both v1 (no filtering) and v2 (silence filtering) data pipelines.
+    When features_path is provided, uses v2 dataloader with silence filtering.
+    """
     device = get_device()
     print(f"Using device: {device}")
 
-    wandb.init(
-        project=config.wandb_project,
-        name=config.wandb_name,
-        config=asdict(config),
-    )
+    # Initialize W&B if project is specified
+    use_wandb = config.wandb_project is not None
+    if use_wandb:
+        wandb.init(
+            project=config.wandb_project,
+            name=config.wandb_name,
+            config=asdict(config),
+        )
+    else:
+        print("W&B logging disabled")
 
-    # Data
-    dataloader = create_dataloader(
-        config.data_path,
-        batch_size=config.batch_size,
-        shuffle=True,
-    )
+    # Data - use v2 dataloader when features_path is provided
+    if config.features_path and config.filter_silence:
+        dataloader = create_dataloader_v2(
+            npz_path=config.data_path,
+            features_path=config.features_path,
+            filter_silence=config.filter_silence,
+            batch_size=config.batch_size,
+            shuffle=True,
+        )
+    else:
+        dataloader = create_dataloader(
+            config.data_path,
+            batch_size=config.batch_size,
+            shuffle=True,
+        )
     data_iter = infinite_dataloader(dataloader)
 
     print(f"Dataset size: {len(dataloader.dataset):,} samples")
@@ -121,7 +150,8 @@ def train(config: TrainConfig):
             if "auxk" in losses:
                 log_dict["loss/auxk"] = losses["auxk"].item()
 
-            wandb.log(log_dict, step=step)
+            if use_wandb:
+                wandb.log(log_dict, step=step)
 
             # Update progress bar
             pbar.set_postfix(
@@ -137,7 +167,8 @@ def train(config: TrainConfig):
 
     # Final save
     save_checkpoint(model, optimizer, config.num_steps, config, checkpoint_dir)
-    wandb.finish()
+    if use_wandb:
+        wandb.finish()
 
     print("Training complete!")
     return model
@@ -162,12 +193,22 @@ def save_checkpoint(model, optimizer, step, config, checkpoint_dir):
 
 
 def load_checkpoint(path: str, device: str = None):
-    """Load model from checkpoint."""
+    """Load model from checkpoint.
+
+    Handles backward compatibility with v1 checkpoints that lack
+    features_path and filter_silence fields.
+    """
     if device is None:
         device = get_device()
 
-    checkpoint = torch.load(path, map_location=device)
-    config = TrainConfig(**checkpoint["config"])
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+
+    # Handle v1 checkpoints missing new fields
+    saved_config = checkpoint["config"]
+    saved_config.setdefault("features_path", None)
+    saved_config.setdefault("filter_silence", False)
+
+    config = TrainConfig(**saved_config)
 
     model = AudioSae(
         d_input=config.d_input,
@@ -184,11 +225,8 @@ def load_checkpoint(path: str, device: str = None):
 
 # Entry point
 if __name__ == "__main__":
-    config = TrainConfig(
-        # Override defaults here or use CLI args
-        data_path="data/drums_encoded.npz",
-        num_steps=50_000,
-        batch_size=256,
-    )
-
+    # v2 training with silence filtering (default config)
+    config = TrainConfig()
+    print(f"Training SAE with {config.expansion_factor}× expansion "
+          f"({config.d_input * config.expansion_factor} features)")
     train(config)

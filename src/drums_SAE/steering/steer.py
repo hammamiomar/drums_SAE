@@ -2,10 +2,14 @@
 Steering utilities for controlling drum generation via SAE features.
 
 Usage:
-    from drums_SAE.steering import ControlVectors, steer_latent
+    from drums_SAE.steering import ControlVectors, steer_latent, steer_with_residual
 
+    # Control vector steering (direction-based)
     cv = ControlVectors.from_checkpoint("checkpoints/sae_step_50000.pt", "feature_summary.csv")
     z_steered = steer_latent(z, cv["brightness"], alpha=0.5)
+
+    # Direct feature manipulation with residual preservation (Gytis trick)
+    z_steered = steer_with_residual(z, sae, feature_idx=1852, value=1.0)
 """
 
 from dataclasses import dataclass
@@ -16,6 +20,101 @@ import pandas as pd
 import torch
 
 from drums_SAE.sae.model import AudioSae
+
+
+# =============================================================================
+# Gytis Residual Trick — Preserve reconstruction quality during steering
+# =============================================================================
+
+
+def steer_with_residual(
+    z: torch.Tensor,
+    sae: AudioSae,
+    feature_idx: int,
+    value: float,
+) -> torch.Tensor:
+    """
+    Steer a latent while preserving reconstruction residual (Gytis trick).
+
+    The SAE can't perfectly reconstruct (R² < 1.0). Without the residual,
+    every steering operation loses ~6% of the signal, washing out fine details.
+    By computing the residual BEFORE modification and adding it back AFTER,
+    we preserve exactly what the SAE couldn't represent.
+
+    Args:
+        z: Normalized latent tensor, shape (n_timesteps, 64) or (batch, n_timesteps, 64)
+        sae: Trained SAE model (will be set to inference mode)
+        feature_idx: Which SAE feature to manipulate (0 to d_hidden-1)
+        value: Target activation value (0 = suppress, positive = enhance)
+
+    Returns:
+        Steered latent with residual preserved, same shape as input
+    """
+    was_training = sae.training
+    sae.training = False  # Set to inference mode
+
+    with torch.no_grad():
+        # Encode to sparse features
+        enc = sae.encode(z, return_aux=False)
+        f = enc["f"]  # RMS-normalized activations, shape (..., d_hidden)
+
+        # Compute residual BEFORE modification — this is what SAE lost
+        z_reconstructed = sae.decode(f)
+        residual = z - z_reconstructed
+
+        # Modify the target feature
+        f_modified = f.clone()
+        f_modified[..., feature_idx] = value
+
+        # Decode and add residual back — preserving fine details
+        z_steered = sae.decode(f_modified) + residual
+
+    sae.training = was_training
+    return z_steered
+
+
+def steer_multi_features_with_residual(
+    z: torch.Tensor,
+    sae: AudioSae,
+    feature_modifications: dict[int, float],
+) -> torch.Tensor:
+    """
+    Steer multiple features at once while preserving residual.
+
+    More efficient than calling steer_with_residual() multiple times
+    because it only encodes/decodes once.
+
+    Args:
+        z: Normalized latent tensor, shape (n_timesteps, 64) or (batch, n_timesteps, 64)
+        sae: Trained SAE model
+        feature_modifications: Dict mapping feature_idx -> target_value
+
+    Returns:
+        Steered latent with all modifications applied
+    """
+    was_training = sae.training
+    sae.training = False
+
+    with torch.no_grad():
+        enc = sae.encode(z, return_aux=False)
+        f = enc["f"]
+
+        z_reconstructed = sae.decode(f)
+        residual = z - z_reconstructed
+
+        f_modified = f.clone()
+        for feature_idx, value in feature_modifications.items():
+            f_modified[..., feature_idx] = value
+
+        z_steered = sae.decode(f_modified) + residual
+
+    sae.training = was_training
+    return z_steered
+
+
+# =============================================================================
+# Control Vector Steering — Direction-based manipulation
+# =============================================================================
 
 
 @dataclass
