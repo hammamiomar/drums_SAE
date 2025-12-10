@@ -23,12 +23,25 @@ from drums_SAE.steering.temporal_steer import (
     steer_temporal_features,
     steer_uniform,
 )
+from drums_SAE.steering.probe_steer import (
+    ProbeSteeringVectors,
+    steer_with_probe,
+    steer_with_probe_bidirectional,
+    steer_to_target_bin,
+    create_steered_triplet,
+)
 
 __all__ = [
+    # Probe-based steering (preferred method)
+    "ProbeSteeringVectors",
+    "steer_with_probe",
+    "steer_with_probe_bidirectional",
+    "steer_to_target_bin",
+    "create_steered_triplet",
     # Core steering with residual (Gytis trick)
     "steer_with_residual",
     "steer_multi_features_with_residual",
-    # Control vector steering
+    # Control vector steering (legacy, correlation-based)
     "ControlVectors",
     "steer_latent",
     "steer_latent_normalized",
