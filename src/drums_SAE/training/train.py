@@ -2,9 +2,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
-import wandb
 from tqdm import tqdm
 
+import wandb
 from drums_SAE.sae.model import AudioSae, compute_metrics, sae_loss
 from drums_SAE.training.data import (
     create_dataloader,
@@ -36,6 +36,7 @@ class TrainConfig:
     # Training
     batch_size: int = 4096  # Larger batches for smaller filtered dataset
     lr: float = 1e-4
+    optimizer: str = "adam"  # "adam" or "adamw" (AdamW adds weight decay)
     num_steps: int = 100_000  # More training steps (v1 was 50,000)
     auxk_coef: float = 1 / 32
 
@@ -110,7 +111,14 @@ def train(config: TrainConfig):
     print(f"Hidden dim: {model.d_hidden}")
 
     # Optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+    if config.optimizer.lower() == "adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=config.lr, weight_decay=0.01
+        )
+        print(f"Using AdamW optimizer (lr={config.lr}, weight_decay=0.01)")
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+        print(f"Using Adam optimizer (lr={config.lr})")
 
     # Checkpoint directory
     checkpoint_dir = Path(config.checkpoint_dir)
@@ -207,6 +215,7 @@ def load_checkpoint(path: str, device: str = None):
     saved_config = checkpoint["config"]
     saved_config.setdefault("features_path", None)
     saved_config.setdefault("filter_silence", False)
+    saved_config.setdefault("optimizer", "adam")
 
     config = TrainConfig(**saved_config)
 
@@ -227,6 +236,8 @@ def load_checkpoint(path: str, device: str = None):
 if __name__ == "__main__":
     # v2 training with silence filtering (default config)
     config = TrainConfig()
-    print(f"Training SAE with {config.expansion_factor}× expansion "
-          f"({config.d_input * config.expansion_factor} features)")
+    print(
+        f"Training SAE with {config.expansion_factor}× expansion "
+        f"({config.d_input * config.expansion_factor} features)"
+    )
     train(config)

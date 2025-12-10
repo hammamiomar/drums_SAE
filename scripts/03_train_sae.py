@@ -20,6 +20,7 @@ Usage:
 
 See CLAUDE.md for hyperparameter guidance and success criteria.
 """
+
 import argparse
 import json
 import subprocess
@@ -111,10 +112,17 @@ def main():
         help="Batch size",
     )
     parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="adam",
+        choices=["adam", "adamw"],
+        help="Optimizer: adam (default) or adamw (with weight decay)",
+    )
+    parser.add_argument(
         "--lr",
         type=float,
         default=1e-4,
-        help="Learning rate",
+        help="Learning rate (default: 1e-4)",
     )
 
     # Logging
@@ -153,6 +161,7 @@ def main():
         topk=args.topk,
         topk_aux=args.topk_aux,
         batch_size=args.batch_size,
+        optimizer=args.optimizer,
         lr=args.lr,
         num_steps=args.num_steps,
         save_every=args.save_every,
@@ -168,10 +177,13 @@ def main():
     print(f"  Data: {config.data_path}")
     print(f"  Features: {config.features_path}")
     print(f"  Filter silence: {config.filter_silence}")
-    print(f"  Model: {config.d_input} → {config.d_input * config.expansion_factor} "
-          f"({config.expansion_factor}× expansion)")
+    print(
+        f"  Model: {config.d_input} → {config.d_input * config.expansion_factor} "
+        f"({config.expansion_factor}× expansion)"
+    )
     print(f"  TopK: {config.topk} (aux: {config.topk_aux})")
-    print(f"  Training: {config.num_steps:,} steps, batch={config.batch_size}, lr={config.lr}")
+    print(f"  Optimizer: {config.optimizer} (lr={config.lr})")
+    print(f"  Training: {config.num_steps:,} steps, batch={config.batch_size}")
     print(f"  Output: {exp_dir}/")
     print("=" * 60)
 
