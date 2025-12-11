@@ -1,3 +1,6 @@
 [submodule "stable-audio-tools"]
 	path = stable-audio-tools
 	url = https://github.com/hammamiomar/stable-audio-tools.git
+[submodule "sdxl-unbox"]
+	path = sdxl-unbox
+	url = https://github.com/surkovv/sdxl-unbox
