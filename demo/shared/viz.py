@@ -388,3 +388,167 @@ def create_audio_triplet_display(
 
     plt.tight_layout(pad=0.5)
     return fig
+
+
+def create_triplet_waveform(
+    audio_less: np.ndarray | None,
+    audio_orig: np.ndarray | None,
+    audio_more: np.ndarray | None,
+    sample_rate: int = 44100,
+    strength: float = 1.0,
+) -> plt.Figure:
+    """
+    Create 3-row stacked waveforms with clear labeling.
+
+    Shows LESS, ORIGINAL, MORE in separate rows for easy comparison.
+    Each row shows the steering magnitude.
+    """
+    audio_less = _ensure_1d(audio_less)
+    audio_orig = _ensure_1d(audio_orig)
+    audio_more = _ensure_1d(audio_more)
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 5), facecolor=COLORS["bg"], sharex=True)
+
+    # Labels with steering magnitude
+    labels = [
+        f"LESS (−{strength:.1f}×)",
+        "ORIGINAL",
+        f"MORE (+{strength:.1f}×)",
+    ]
+    audios = [audio_less, audio_orig, audio_more]
+    colors_list = [COLORS["accent_dim"], COLORS["text_dim"], COLORS["accent"]]
+
+    # Get time axis from first available audio
+    audio_ref = next((a for a in audios if a is not None), None)
+    if audio_ref is not None:
+        time = np.linspace(0, len(audio_ref) / sample_rate, len(audio_ref))
+    else:
+        time = np.array([0, 1])
+
+    for ax, audio, label, color in zip(axes, audios, labels, colors_list):
+        _setup_ax(ax)
+
+        if audio is not None:
+            # Fill area for visual weight
+            ax.fill_between(time, audio, 0, color=color, alpha=0.2)
+            ax.plot(time, audio, color=color, linewidth=0.8, alpha=0.9)
+            ax.set_xlim(0, time[-1])
+
+            # Find amplitude range
+            amp_max = max(abs(audio.min()), abs(audio.max()), 0.1)
+            ax.set_ylim(-amp_max * 1.1, amp_max * 1.1)
+        else:
+            ax.set_xlim(0, 1)
+            ax.set_ylim(-1, 1)
+            ax.text(
+                0.5, 0.5, "NO AUDIO",
+                ha="center", va="center",
+                color=COLORS["text_muted"],
+                fontsize=10, fontfamily="monospace",
+                transform=ax.transAxes,
+            )
+
+        # Label on the left side
+        ax.text(
+            0.02, 0.85, label,
+            transform=ax.transAxes,
+            color=color,
+            fontsize=10, fontfamily="monospace",
+            fontweight="bold",
+            verticalalignment="top",
+        )
+
+        ax.axhline(y=0, color=COLORS["border"], linewidth=0.5)
+
+    # Only show x-axis label on bottom
+    axes[-1].set_xlabel("TIME (s)", color=COLORS["text_dim"], fontsize=9, fontfamily="monospace")
+
+    plt.tight_layout(pad=0.5)
+    return fig
+
+
+def create_triplet_spectrogram(
+    audio_less: np.ndarray | None,
+    audio_orig: np.ndarray | None,
+    audio_more: np.ndarray | None,
+    sample_rate: int = 44100,
+    strength: float = 1.0,
+) -> plt.Figure:
+    """
+    Create 3-panel spectrogram: LESS | ORIGINAL | MORE.
+
+    All panels share the same colorscale for fair comparison.
+    Labels show steering magnitude.
+    """
+    from scipy import signal
+
+    audio_less = _ensure_1d(audio_less)
+    audio_orig = _ensure_1d(audio_orig)
+    audio_more = _ensure_1d(audio_more)
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 3), facecolor=COLORS["bg"])
+
+    for ax in axes:
+        _setup_ax(ax)
+
+    audios = [audio_less, audio_orig, audio_more]
+    titles = [
+        f"LESS (−{strength:.1f}×)",
+        "ORIGINAL",
+        f"MORE (+{strength:.1f}×)",
+    ]
+    title_colors = [COLORS["accent_dim"], COLORS["text"], COLORS["accent"]]
+
+    # Compute all spectrograms first to find shared colorscale
+    specs = []
+    for audio in audios:
+        if audio is not None:
+            f, t, Sxx = signal.spectrogram(
+                audio, fs=sample_rate,
+                nperseg=1024, noverlap=768,
+            )
+            Sxx_db = 10 * np.log10(Sxx + 1e-10)
+            specs.append((f, t, Sxx_db))
+        else:
+            specs.append(None)
+
+    # Find shared vmin/vmax
+    all_db = [s[2] for s in specs if s is not None]
+    if all_db:
+        vmax = max(s.max() for s in all_db)
+        vmin = vmax - 60  # 60dB dynamic range
+    else:
+        vmin, vmax = -60, 0
+
+    # Plot each spectrogram
+    for ax, spec, title, title_color in zip(axes, specs, titles, title_colors):
+        if spec is not None:
+            f, t, Sxx_db = spec
+            ax.pcolormesh(
+                t, f, Sxx_db,
+                shading="gouraud",
+                cmap="magma",
+                vmin=vmin, vmax=vmax,
+            )
+            ax.set_ylim(0, 8000)
+            ax.set_ylabel("FREQ (Hz)", color=COLORS["text_dim"], fontsize=8, fontfamily="monospace")
+            ax.set_xlabel("TIME (s)", color=COLORS["text_dim"], fontsize=8, fontfamily="monospace")
+        else:
+            ax.text(
+                0.5, 0.5, "NO AUDIO",
+                ha="center", va="center",
+                color=COLORS["text_muted"],
+                fontsize=10, fontfamily="monospace",
+                transform=ax.transAxes,
+            )
+
+        ax.set_title(
+            title,
+            color=title_color,
+            fontsize=10, fontfamily="monospace",
+            fontweight="bold",
+            pad=6,
+        )
+
+    plt.tight_layout(pad=0.5)
+    return fig

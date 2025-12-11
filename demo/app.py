@@ -1,75 +1,128 @@
 """
-Drums SAE Steering Demo - Brutalist Techno DAW
-==============================================
+Drums SAE Steering Lab — Probe-Based Audio Control
+====================================================
 
-Main Gradio 6 application with three-panel layout for maximum experimentability.
+Research demo for evaluating and steering drum sounds using
+probe-based steering vectors. Supports multiple models with
+automatic steering vector loading.
+
+Usage:
+    DYLD_FALLBACK_LIBRARY_PATH=/usr/local/ffmpeg7/lib uv run python demo/app.py
 """
 
 import sys
-import time
 from pathlib import Path
 
 import gradio as gr
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-import torchaudio
 
-# Add src to path for imports
-_project_root = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_project_root / "src"))
+# Add paths for imports
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+sys.path.insert(0, str(PROJECT_ROOT))
 
-from .config import (
-    CONFIG,
-    MODE_SLIDERS,
-    PROJECT_ROOT,
-    SLIDER_LABELS,
-    TEMPORAL_MODES,
+from drums_SAE.sae.model import AudioSae
+from drums_SAE.steering import (
+    ProbeSteeringVectors,
+    create_steered_triplet,
 )
-from .state import (
-    SessionState,
-    SteeringHistoryItem,
-    build_property_params,
-    format_alpha_display,
-    get_active_properties,
-    has_active_steering,
-)
-from .theme import BRUTALIST_CSS
-from .viz import (
-    create_alpha_envelope,
-    create_empty_plot,
-    create_spectrogram_comparison,
-    create_waveform_overlay,
-)
-
-# =============================================================================
-# Device Detection
-# =============================================================================
-
-DEVICE = (
-    "cuda" if torch.cuda.is_available()
-    else "mps" if torch.backends.mps.is_available()
-    else "cpu"
-)
+from demo.shared.vae import DEVICE, decode_latents_to_audio, load_latent_stats, load_vae
+from demo.shared.viz import create_triplet_spectrogram, create_triplet_waveform
 
 
 # =============================================================================
-# Model Loading
+# Configuration
 # =============================================================================
 
-def load_models() -> dict:
-    """Load SAE, control vectors, temporal vectors, dataset, and VAE."""
-    from drums_SAE.sae.model import AudioSae
-    from drums_SAE.training.data import LatentDataset
+SAMPLE_RATE = 44100
 
-    print(f"\n[LOAD] Device: {DEVICE}")
+# Strength slider (positive only - triplets apply ±)
+STRENGTH_MIN = 0.5
+STRENGTH_MAX = 6.0
+STRENGTH_DEFAULT = 1.5
 
-    checkpoint_path = PROJECT_ROOT / CONFIG.checkpoint_path
-    feature_summary_path = PROJECT_ROOT / CONFIG.feature_summary_path
-    latent_data_path = PROJECT_ROOT / CONFIG.latent_data_path
+# Sample settings
+MAX_SAMPLES = 3
+DEFAULT_SAMPLES = 3
 
-    # Load SAE
+# Human-readable property names
+PROPERTY_DISPLAY = {
+    "spectral_centroid": "Brightness",
+    "rms": "Loudness",
+    "crest_factor": "Punchiness",
+    "bass": "Body/Warmth",
+    "brightness": "Brightness",
+    "loudness": "Loudness",
+    "boominess": "Boominess",
+    "hardness": "Hardness",
+    "depth": "Depth",
+}
+
+# Preferred order for properties
+PROPERTY_ORDER = [
+    "spectral_centroid", "rms", "crest_factor", "bass",  # V2
+    "brightness", "loudness", "boominess", "hardness", "depth",  # V1
+]
+
+
+def sort_properties(props: list[str]) -> list[str]:
+    """Sort properties in preferred display order."""
+    def key(p):
+        try:
+            return PROPERTY_ORDER.index(p)
+        except ValueError:
+            return len(PROPERTY_ORDER)
+    return sorted(props, key=key)
+
+
+def get_property_label(prop: str) -> str:
+    """Get label showing both display name and internal name."""
+    display = PROPERTY_DISPLAY.get(prop, prop.replace("_", " ").title())
+    return f"{display} ({prop})"
+
+
+# =============================================================================
+# Model Discovery and Loading
+# =============================================================================
+
+def discover_models() -> list[str]:
+    """Find all experiments with steering vectors."""
+    models = []
+    experiments_dir = PROJECT_ROOT / "experiments"
+
+    if not experiments_dir.exists():
+        print("[WARN] No experiments directory found")
+        return models
+
+    for exp_dir in experiments_dir.iterdir():
+        if not exp_dir.is_dir():
+            continue
+        vectors_path = exp_dir / "eval" / "steering_vectors.npz"
+        if vectors_path.exists():
+            models.append(exp_dir.name)
+
+    # Sort with v2_main first
+    return sorted(models, key=lambda x: (not x.startswith("v2_main"), x))
+
+
+def detect_version(model_name: str) -> str:
+    """Detect v1/v2 from model name."""
+    if model_name.startswith("v1"):
+        return "v1"
+    return "v2"
+
+
+def get_data_paths(version: str) -> tuple[str, str | None]:
+    """Get latent and features paths for version."""
+    if version == "v1":
+        return "data/drums_encoded.npz", None
+    return "data/latents_v2.npz", "data/features_v2.csv"
+
+
+def load_sae_checkpoint(checkpoint_path: Path) -> AudioSae:
+    """Load SAE from checkpoint file."""
     checkpoint = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
     cfg = checkpoint["config"]
 
@@ -77,102 +130,94 @@ def load_models() -> dict:
         d_input=cfg["d_input"],
         expansion_factor=cfg["expansion_factor"],
         topk=cfg["topk"],
-        topk_aux=cfg["topk_aux"],
-        dead_threshold=cfg["dead_threshold"],
+        topk_aux=cfg.get("topk_aux", 128),
+        dead_threshold=cfg.get("dead_threshold", 10000),
     ).to(DEVICE)
     sae.load_state_dict(checkpoint["model_state_dict"])
-    sae.eval()
-    print(f"[LOAD] SAE: {cfg['d_input']} -> {cfg['d_input'] * cfg['expansion_factor']} dims")
+    sae.training = False
 
-    # Load feature summary
-    feature_df = pd.read_csv(feature_summary_path)
-    print(f"[LOAD] Features: {len(feature_df)}")
+    print(f"[SAE] Loaded: {cfg['d_input']} → {cfg['d_input'] * cfg['expansion_factor']} features")
+    return sae
 
-    # Build control vectors
-    W_dec = sae.decoder.weight.data.cpu()
-    control_vectors = {}
-    attack_ratios = feature_df["attack_ratio"].values
 
-    for label in CONFIG.steering_labels:
-        corr_col = f"corr_{label}"
-        if corr_col not in feature_df.columns:
-            continue
-        corr = feature_df[corr_col].values
-        if np.abs(corr).max() < 0.05:
-            continue
+def load_latents(
+    latents_path: str,
+    features_path: str | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int], int]:
+    """Load and normalize latents, return sample indices."""
+    latent_data = np.load(PROJECT_ROOT / latents_path)
+    all_latents = torch.from_numpy(latent_data["latents"]).float().to(DEVICE)
+    latent_mean, latent_std = load_latent_stats(str(PROJECT_ROOT / latents_path), DEVICE)
 
-        top_k = 20
-        top_idx = np.argsort(np.abs(corr))[-top_k:]
-        weights = torch.tensor(corr[top_idx], dtype=torch.float32)
-        vec = W_dec[:, top_idx] @ weights
-        vec = vec / vec.norm()
+    # Normalize
+    all_latents_norm = (all_latents - latent_mean) / (latent_std + 1e-8)
 
-        control_vectors[label] = {
-            "direction": vec.to(DEVICE),
-            "correlations": corr,
-            "top_features": top_idx,
-            "max_corr": float(np.abs(corr).max()),
-        }
+    # Determine timesteps per sample
+    n_timesteps = 16 if "v2" in latents_path else 32
+    n_total_samples = len(all_latents) // n_timesteps
 
-    print(f"[LOAD] Control vectors: {list(control_vectors.keys())}")
+    # Filter to non-silence samples if features available
+    if features_path is not None:
+        features_df = pd.read_csv(PROJECT_ROOT / features_path)
+        non_silence_mask = ~features_df["is_silence"].values
 
-    # Build temporal control vectors
-    temporal_vectors = {}
-    attack_threshold = np.median(attack_ratios[attack_ratios > 0])
+        sample_has_content = []
+        for i in range(n_total_samples):
+            start = i * n_timesteps
+            end = start + n_timesteps
+            if non_silence_mask[start:end].any():
+                sample_has_content.append(i)
+        sample_indices = sample_has_content
+    else:
+        sample_indices = list(range(n_total_samples))
 
-    for label in control_vectors.keys():
-        corr = control_vectors[label]["correlations"]
-        attack_mask = (attack_ratios > attack_threshold) & (np.abs(corr) > 0.05)
-        sustain_mask = (attack_ratios <= attack_threshold) & (attack_ratios > 0) & (np.abs(corr) > 0.05)
+    print(f"[DATA] {len(sample_indices)} samples with content")
+    return all_latents_norm, latent_mean, latent_std, sample_indices, n_timesteps
 
-        def build_vec(mask):
-            if mask.sum() >= 5:
-                idx = np.where(mask)[0]
-                top = idx[np.argsort(np.abs(corr[idx]))[-10:]]
-                w = torch.tensor(corr[top], dtype=torch.float32)
-                v = W_dec[:, top] @ w
-                return (v / (v.norm() + 1e-8)).to(DEVICE)
-            return control_vectors[label]["direction"]
 
-        temporal_vectors[label] = {
-            "attack": build_vec(attack_mask),
-            "sustain": build_vec(sustain_mask),
-        }
+def load_model(model_name: str, vae) -> dict | None:
+    """Load all components for a model."""
+    exp_dir = PROJECT_ROOT / "experiments" / model_name
 
-    # Load dataset
-    dataset = LatentDataset(str(latent_data_path), normalize=True)
-    n_samples = len(dataset) // CONFIG.n_timesteps
-    print(f"[LOAD] Dataset: {n_samples:,} samples")
+    # Find checkpoint
+    checkpoint_path = exp_dir / "checkpoints" / "sae_latest.pt"
+    if not checkpoint_path.exists():
+        ckpts = list((exp_dir / "checkpoints").glob("sae_*.pt"))
+        if ckpts:
+            checkpoint_path = sorted(ckpts)[-1]
+        else:
+            print(f"[ERROR] No checkpoint found for {model_name}")
+            return None
 
-    # Load normalization stats
-    latent_data = np.load(latent_data_path)
-    latent_mean = torch.tensor(latent_data["mean"], dtype=torch.float32).to(DEVICE)
-    latent_std = torch.tensor(latent_data["std"], dtype=torch.float32).to(DEVICE)
+    # Load steering vectors
+    vectors_path = exp_dir / "eval" / "steering_vectors.npz"
+    if not vectors_path.exists():
+        print(f"[ERROR] No steering vectors for {model_name}")
+        return None
 
-    # Load VAE
-    vae = None
-    try:
-        from stable_audio_tools import get_pretrained_model
-        print("[LOAD] Loading VAE...")
-        model, _ = get_pretrained_model("stabilityai/stable-audio-open-1.0")
-        vae = model.pretransform.model.to(DEVICE)
-        for p in vae.parameters():
-            p.requires_grad = False
-        print("[LOAD] VAE ready")
-    except Exception as e:
-        print(f"[WARN] VAE unavailable: {e}")
+    print(f"\n[LOAD] Model: {model_name}")
+
+    sae = load_sae_checkpoint(checkpoint_path)
+    vectors = ProbeSteeringVectors.load(str(vectors_path))
+    print(f"[STEER] Properties: {vectors.properties}")
+
+    version = detect_version(model_name)
+    latents_path, features_path = get_data_paths(version)
+    latents_norm, latent_mean, latent_std, sample_indices, n_timesteps = load_latents(
+        latents_path, features_path
+    )
 
     return {
+        "name": model_name,
         "sae": sae,
-        "control_vectors": control_vectors,
-        "temporal_vectors": temporal_vectors,
-        "dataset": dataset,
+        "steering": vectors,
+        "latents_norm": latents_norm,
         "latent_mean": latent_mean,
         "latent_std": latent_std,
+        "sample_indices": sample_indices,
+        "n_timesteps": n_timesteps,
+        "version": version,
         "vae": vae,
-        "n_samples": n_samples,
-        "attack_ratios": attack_ratios,
-        "feature_df": feature_df,
     }
 
 
@@ -180,681 +225,259 @@ def load_models() -> dict:
 # Steering Functions
 # =============================================================================
 
-def get_audio_latents(models: dict, audio_idx: int) -> torch.Tensor:
-    """Get all 32 latent vectors for one audio sample."""
-    dataset = models["dataset"]
-    start = audio_idx * CONFIG.n_timesteps
-    end = start + CONFIG.n_timesteps
-    return torch.stack([dataset[i] for i in range(start, end)]).to(DEVICE)
+def get_sample_latents(models: dict, sample_idx: int) -> torch.Tensor:
+    """Get normalized latents for a single sample."""
+    n_timesteps = models["n_timesteps"]
+    start = sample_idx * n_timesteps
+    end = start + n_timesteps
+    return models["latents_norm"][start:end]
 
-
-def steer_uniform(z, direction, alpha):
-    return z + alpha * direction.unsqueeze(0)
-
-
-def steer_segment(z, direction, alpha_attack, alpha_body, alpha_tail):
-    z_out = z.clone()
-    z_out[:CONFIG.attack_end] += alpha_attack * direction
-    z_out[CONFIG.attack_end:CONFIG.body_end] += alpha_body * direction
-    z_out[CONFIG.body_end:] += alpha_tail * direction
-    return z_out
-
-
-def steer_envelope(z, direction, alpha_start, alpha_end):
-    alphas = torch.linspace(alpha_start, alpha_end, CONFIG.n_timesteps, device=DEVICE)
-    return z + alphas.unsqueeze(1) * direction.unsqueeze(0)
-
-
-def steer_temporal(z, attack_dir, sustain_dir, alpha_attack, alpha_sustain):
-    z_out = z.clone()
-    z_out[:CONFIG.attack_end] += alpha_attack * attack_dir
-    z_out[CONFIG.attack_end:] += alpha_sustain * sustain_dir
-    return z_out
-
-
-def apply_steering(models, z, label, mode, params):
-    """Apply steering for a single property."""
-    cv = models["control_vectors"]
-    tv = models["temporal_vectors"]
-
-    if label not in cv:
-        return z
-
-    direction = cv[label]["direction"]
-
-    if mode == "uniform":
-        return steer_uniform(z, direction, params.get("alpha", 0.0))
-    elif mode == "segment":
-        return steer_segment(
-            z, direction,
-            params.get("alpha_attack", 0.0),
-            params.get("alpha_body", 0.0),
-            params.get("alpha_tail", 0.0),
-        )
-    elif mode == "envelope":
-        return steer_envelope(
-            z, direction,
-            params.get("alpha_start", 0.0),
-            params.get("alpha_end", 0.0),
-        )
-    elif mode == "temporal_features":
-        return steer_temporal(
-            z,
-            tv[label]["attack"],
-            tv[label]["sustain"],
-            params.get("alpha_attack", 0.0),
-            params.get("alpha_sustain", 0.0),
-        )
-    return z
-
-
-def multi_property_steer(models, z, mode, property_params):
-    """Apply steering for multiple properties sequentially."""
-    z_steered = z.clone()
-    for label, params in property_params.items():
-        if all(abs(v) < 1e-6 for v in params.values()):
-            continue
-        z_steered = apply_steering(models, z_steered, label, mode, params)
-    return z_steered
-
-
-# =============================================================================
-# Audio Decoding
-# =============================================================================
 
 def decode_to_audio(z_norm: torch.Tensor, models: dict) -> np.ndarray | None:
-    """Decode normalized latents to audio. Returns 1D mono array."""
-    vae = models["vae"]
-    if vae is None:
-        return None
+    """Decode normalized latents to audio."""
+    return decode_latents_to_audio(
+        z_norm,
+        models["vae"],
+        models["latent_mean"],
+        models["latent_std"],
+    )
 
-    from einops import rearrange
 
-    if z_norm.dim() == 2:
-        z_norm = z_norm.unsqueeze(0)
+def generate_triplet(
+    models: dict,
+    sample_idx: int,
+    property_name: str,
+    strength: float,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Generate (less, original, more) audio triplet."""
+    z = get_sample_latents(models, sample_idx)
 
-    z = z_norm * models["latent_std"] + models["latent_mean"]
-    z = rearrange(z, "b t c -> b c t")
+    z_less, z_orig, z_more = create_steered_triplet(
+        z, models["sae"], models["steering"], property_name, strength
+    )
 
-    with torch.no_grad():
-        audio = vae.decode(z)
+    audio_less = decode_to_audio(z_less, models)
+    audio_orig = decode_to_audio(z_orig, models)
+    audio_more = decode_to_audio(z_more, models)
 
-    # VAE outputs (batch, channels, samples) - extract mono
-    audio = audio.cpu().numpy()
-    audio = np.squeeze(audio)  # Remove batch dim if present
-
-    # If stereo (2, samples) or (samples, 2), take first channel
-    if audio.ndim == 2:
-        if audio.shape[0] <= 2:  # (channels, samples)
-            audio = audio[0]
-        else:  # (samples, channels)
-            audio = audio[:, 0]
-
-    # Ensure float32 in [-1, 1] range for Gradio
-    audio = audio.astype(np.float32)
-    if np.abs(audio).max() > 1.0:
-        audio = audio / np.abs(audio).max()
-
-    return audio
+    return audio_less, audio_orig, audio_more
 
 
 # =============================================================================
-# Gradio Interface Builder
+# Gradio Interface
 # =============================================================================
 
-def build_interface(models: dict) -> gr.Blocks:
-    """Build the Gradio 6 interface - Tangled Cables DAW layout."""
+def build_interface() -> gr.Blocks:
+    """Build the Gradio interface."""
 
-    n_samples = models["n_samples"]
-    available_labels = list(models["control_vectors"].keys())
+    available_models = discover_models()
+    if not available_models:
+        print("[ERROR] No models with steering vectors found!")
+        available_models = ["(none)"]
 
-    # Create sample choices
-    sample_choices = [(f"{i:04d}", i) for i in range(min(CONFIG.max_samples_in_dropdown, n_samples))]
+    default_model = available_models[0]
 
-    with gr.Blocks(title="DRUMS SAE STEERING") as demo:
+    print("\n[INIT] Loading VAE...")
+    vae = load_vae(DEVICE)
 
-        # Session state
-        state = gr.State(SessionState())
+    print(f"\n[INIT] Loading default model: {default_model}")
+    initial_models = load_model(default_model, vae) if default_model != "(none)" else None
 
-        # =====================================================================
-        # HEADER with logo
-        # =====================================================================
-        with gr.Row():
-            gr.Image(
-                value=str(PROJECT_ROOT / "demo" / "logos" / "logo.png"),
-                show_label=False,
-                height=60,
-                width=60,
-                scale=0,
-                container=False,
-            )
-            gr.Markdown("# DRUMS SAE STEERING")
+    # Mutable container for current model
+    model_container = {"current": initial_models, "vae": vae}
+
+    with gr.Blocks(title="DRUMS SAE STEERING LAB") as demo:
 
         # =====================================================================
-        # TOP ROW: Sample + A/B Transport
+        # Header
         # =====================================================================
-        with gr.Row():
-            sample_dropdown = gr.Dropdown(
-                choices=sample_choices,
-                value=0,
-                label="SAMPLE",
-                scale=2,
-            )
-            random_btn = gr.Button("RND", scale=1)
-            ab_a_btn = gr.Button("A ORIGINAL", variant="primary", scale=2)  # Active by default
-            ab_b_btn = gr.Button("B STEERED", variant="secondary", scale=2)
+        gr.Markdown("# 🔬 DRUMS SAE STEERING LAB")
+        gr.Markdown(
+            "Probe-based steering for interpretable drum sound control. "
+            "Triplets show **LESS** (−strength) / **ORIGINAL** / **MORE** (+strength)."
+        )
 
         # =====================================================================
-        # MAIN "TV SCREEN" - Audio + Waveform
-        # =====================================================================
-        with gr.Group():
-            main_audio = gr.Audio(
-                label=None,
-                type="numpy",
-                interactive=False,
-            )
-            waveform_plot = gr.Plot(label=None)
-
-        # =====================================================================
-        # CONTROL PANEL - Property, Mode, Alpha side by side
+        # Control Panel
         # =====================================================================
         with gr.Row():
-            # Property selector
             with gr.Column(scale=1):
-                gr.Markdown("### PROPERTY")
-                property_radio = gr.Radio(
-                    choices=available_labels,
-                    value=available_labels[0],
-                    show_label=False,
-                    interactive=True,
+                model_dropdown = gr.Dropdown(
+                    choices=available_models,
+                    value=default_model,
+                    label="MODEL",
+                    info="Experiment with steering vectors",
                 )
 
-            # Mode selector
             with gr.Column(scale=1):
-                gr.Markdown("### MODE")
-                mode_radio = gr.Radio(
-                    choices=["uniform", "segment", "envelope", "temporal_features"],
-                    value="uniform",
-                    show_label=False,
-                    interactive=True,
+                initial_props = sort_properties(initial_models["steering"].properties) if initial_models else []
+                initial_choices = [(get_property_label(p), p) for p in initial_props]
+                property_dropdown = gr.Dropdown(
+                    choices=initial_choices,
+                    value=initial_props[0] if initial_props else None,
+                    label="PROPERTY",
+                    info="Acoustic property to steer",
                 )
-                mode_desc = gr.Markdown(f"*{TEMPORAL_MODES['uniform']}*")
 
-            # Alpha sliders
             with gr.Column(scale=2):
-                gr.Markdown("### ALPHA")
-
-                # Uniform mode slider (visible by default)
-                uniform_slider = gr.Slider(
-                    minimum=CONFIG.alpha_min,
-                    maximum=CONFIG.alpha_max,
-                    value=CONFIG.alpha_default,
-                    step=CONFIG.alpha_step,
-                    label="STRENGTH",
-                    info="+ adds property, - removes it",
-                    visible=True,
+                strength_slider = gr.Slider(
+                    minimum=STRENGTH_MIN,
+                    maximum=STRENGTH_MAX,
+                    value=STRENGTH_DEFAULT,
+                    step=0.1,
+                    label="STEERING STRENGTH",
+                    info="Applied as ± to create LESS/MORE triplets",
                 )
 
-                # Segment mode sliders (hidden by default)
-                segment_attack = gr.Slider(
-                    minimum=CONFIG.alpha_min, maximum=CONFIG.alpha_max,
-                    value=0, step=CONFIG.alpha_step, label="ATTACK [0-375ms]",
-                    info="Transient/hit - affects punch",
-                    visible=False,
-                )
-                segment_body = gr.Slider(
-                    minimum=CONFIG.alpha_min, maximum=CONFIG.alpha_max,
-                    value=0, step=CONFIG.alpha_step, label="BODY [375-1125ms]",
-                    info="Main resonance - affects tone",
-                    visible=False,
-                )
-                segment_tail = gr.Slider(
-                    minimum=CONFIG.alpha_min, maximum=CONFIG.alpha_max,
-                    value=0, step=CONFIG.alpha_step, label="TAIL [1125-1500ms]",
-                    info="Decay/release - affects sustain",
-                    visible=False,
-                )
-
-                # Envelope mode sliders (hidden by default)
-                envelope_start = gr.Slider(
-                    minimum=CONFIG.alpha_min, maximum=CONFIG.alpha_max,
-                    value=0, step=CONFIG.alpha_step, label="START",
-                    info="Alpha at beginning",
-                    visible=False,
-                )
-                envelope_end = gr.Slider(
-                    minimum=CONFIG.alpha_min, maximum=CONFIG.alpha_max,
-                    value=0, step=CONFIG.alpha_step, label="END",
-                    info="Alpha at end (linear interpolation)",
-                    visible=False,
-                )
-
-                # Temporal features mode sliders (hidden by default)
-                temporal_attack = gr.Slider(
-                    minimum=CONFIG.alpha_min, maximum=CONFIG.alpha_max,
-                    value=0, step=CONFIG.alpha_step, label="ATTACK FEATURES",
-                    info="SAE features that fire during transient",
-                    visible=False,
-                )
-                temporal_sustain = gr.Slider(
-                    minimum=CONFIG.alpha_min, maximum=CONFIG.alpha_max,
-                    value=0, step=CONFIG.alpha_step, label="SUSTAIN FEATURES",
-                    info="SAE features that fire during body/tail",
-                    visible=False,
-                )
-
-        # =====================================================================
-        # BOTTOM ROW: Actions + Status
-        # =====================================================================
         with gr.Row():
-            apply_btn = gr.Button("STEER", variant="primary", scale=3)
-            reset_btn = gr.Button("RESET", scale=1)
-            save_btn = gr.Button("SAVE", scale=1)
-        status_text = gr.Markdown("*Select sample to begin*")
+            n_samples_slider = gr.Slider(
+                minimum=1,
+                maximum=MAX_SAMPLES,
+                value=DEFAULT_SAMPLES,
+                step=1,
+                label="SAMPLES",
+            )
+            seed_input = gr.Number(
+                value=42,
+                label="SEED",
+                precision=0,
+            )
+            generate_btn = gr.Button("▶ GENERATE", variant="primary", scale=2)
+
+        status_text = gr.Markdown("*Select model and click GENERATE to begin*")
 
         # =====================================================================
-        # EXTRA TABS (collapsed by default)
+        # Results Area - 3 sample rows
         # =====================================================================
-        with gr.Accordion("MORE VISUALIZATIONS", open=False):
-            with gr.Tabs():
-                with gr.Tab("SPECTROGRAM"):
-                    spectrogram_plot = gr.Plot(label=None)
-                with gr.Tab("ALPHA ENVELOPE"):
-                    envelope_plot = gr.Plot(label=None)
-                with gr.Tab("FEATURE INFO"):
-                    with gr.Row():
-                        data_readout = gr.Markdown("**PROP:** ---\n**MODE:** ---\n**ALPHA:** ---")
-                        feature_info = gr.Markdown("*Select property*")
-                        history_display = gr.Markdown("")
+        gr.Markdown("---")
+
+        sample_outputs = []
+
+        for i in range(3):
+            with gr.Group():
+                gr.Markdown(f"### SAMPLE {i + 1}")
+                with gr.Row():
+                    less_audio = gr.Audio(label="LESS", type="numpy", interactive=False)
+                    orig_audio = gr.Audio(label="ORIGINAL", type="numpy", interactive=False)
+                    more_audio = gr.Audio(label="MORE", type="numpy", interactive=False)
+                with gr.Row():
+                    waveform_plot = gr.Plot(label="Waveform Comparison")
+                    spectrogram_plot = gr.Plot(label="Spectrogram Comparison")
+
+            sample_outputs.append({
+                "less": less_audio,
+                "orig": orig_audio,
+                "more": more_audio,
+                "waveform": waveform_plot,
+                "spectrogram": spectrogram_plot,
+            })
 
         # =====================================================================
-        # EVENT HANDLERS
+        # Event Handlers
         # =====================================================================
 
-        def on_mode_change(mode):
-            """Update visibility and reset sliders based on mode."""
-            is_uniform = mode == "uniform"
-            is_segment = mode == "segment"
-            is_envelope = mode == "envelope"
-            is_temporal = mode == "temporal_features"
+        def on_model_change(model_name):
+            """Load new model and update property dropdown."""
+            if model_name == "(none)":
+                model_container["current"] = None
+                return gr.update(choices=[], value=None), "*No model selected*"
+
+            print(f"\n[UI] Switching to model: {model_name}")
+            new_models = load_model(model_name, model_container["vae"])
+
+            if new_models is None:
+                return gr.update(choices=[], value=None), f"*Failed to load {model_name}*"
+
+            model_container["current"] = new_models
+
+            props = sort_properties(new_models["steering"].properties)
+            choices = [(get_property_label(p), p) for p in props]
 
             return (
-                # Description
-                f"*{TEMPORAL_MODES[mode]}*",
-                # Uniform slider - visible + reset
-                gr.update(visible=is_uniform, value=0),
-                # Segment sliders - visible + reset
-                gr.update(visible=is_segment, value=0),
-                gr.update(visible=is_segment, value=0),
-                gr.update(visible=is_segment, value=0),
-                # Envelope sliders - visible + reset
-                gr.update(visible=is_envelope, value=0),
-                gr.update(visible=is_envelope, value=0),
-                # Temporal sliders - visible + reset
-                gr.update(visible=is_temporal, value=0),
-                gr.update(visible=is_temporal, value=0),
+                gr.update(choices=choices, value=props[0] if props else None),
+                f"*Loaded {model_name} — {len(props)} properties*",
             )
 
-        mode_radio.change(
-            fn=on_mode_change,
-            inputs=[mode_radio],
-            outputs=[
-                mode_desc,
-                uniform_slider,
-                segment_attack, segment_body, segment_tail,
-                envelope_start, envelope_end,
-                temporal_attack, temporal_sustain,
-            ],
+        model_dropdown.change(
+            fn=on_model_change,
+            inputs=[model_dropdown],
+            outputs=[property_dropdown, status_text],
         )
 
-        def on_random_sample():
-            """Select random sample."""
-            idx = np.random.randint(0, min(CONFIG.max_samples_in_dropdown, n_samples))
-            return gr.update(value=idx)
+        def on_generate(model_name, property_name, strength, n_samples, seed):
+            """Generate batch of triplets."""
+            models_dict = model_container["current"]
 
-        random_btn.click(fn=on_random_sample, outputs=[sample_dropdown])
+            print(f"\n[GEN] property={property_name}, strength={strength}, n_samples_raw={n_samples} (type={type(n_samples).__name__}), seed={seed}")
 
-        def on_property_change(prop, session_state):
-            """Update feature info when property changes."""
-            if prop not in models["control_vectors"]:
-                return "---", session_state
+            if models_dict is None:
+                empty_outputs = [None] * 15 + ["*No model loaded*"]
+                return empty_outputs
 
-            cv = models["control_vectors"][prop]
-            top_idx = cv["top_features"]
-            corrs = cv["correlations"][top_idx]
-            max_corr = cv["max_corr"]
+            if property_name is None or property_name not in models_dict["steering"].properties:
+                print(f"  [ERROR] Invalid property: {property_name}")
+                print(f"  Available: {models_dict['steering'].properties}")
+                empty_outputs = [None] * 15 + [f"*Invalid property: {property_name}*"]
+                return empty_outputs
 
-            # Format feature info
-            lines = [f"**{prop.upper()}** (max |r| = {max_corr:.3f})\n"]
-            for idx, c in zip(top_idx[-5:], corrs[-5:]):
-                lines.append(f"`F{idx:04d}`: {c:+.3f}")
+            n_samples = int(min(n_samples, 3))
+            seed = int(seed)
+            strength = float(strength)
 
-            session_state.current_property = prop
-            return "\n".join(lines), session_state
-
-        property_radio.change(
-            fn=on_property_change,
-            inputs=[property_radio, state],
-            outputs=[feature_info, state],
-        )
-
-        def on_sample_change(sample_idx, session_state):
-            """Load sample and decode original audio."""
-            z_original = get_audio_latents(models, sample_idx)
-            audio_original = decode_to_audio(z_original, models)
-
-            session_state.current_sample_idx = sample_idx
-            session_state.z_original = z_original
-            session_state.audio_original = audio_original
-            session_state.z_steered = None
-            session_state.audio_steered = None
-            session_state.current_playback = "A"
-
-            # Create initial visualizations
-            waveform_fig = create_waveform_overlay(audio_original, None)
-            spec_fig = create_spectrogram_comparison(audio_original, None)
-            env_fig = create_empty_plot("APPLY STEERING TO SEE ENVELOPE")
-
-            audio_out = (CONFIG.sample_rate, audio_original) if audio_original is not None else None
-
-            return (
-                audio_out,
-                waveform_fig,
-                spec_fig,
-                env_fig,
-                f"*Loaded sample {sample_idx}*",
-                session_state,
+            # Select random samples
+            np.random.seed(seed)
+            sample_indices = models_dict["sample_indices"]
+            selected = np.random.choice(
+                sample_indices,
+                size=min(n_samples, len(sample_indices)),
+                replace=False,
             )
 
-        sample_dropdown.change(
-            fn=on_sample_change,
-            inputs=[sample_dropdown, state],
-            outputs=[main_audio, waveform_plot, spectrogram_plot, envelope_plot, status_text, state],
-        )
+            # Generate triplets
+            outputs = []
+            for i, sample_idx in enumerate(selected):
+                print(f"  Sample {i + 1}/{n_samples} (idx={sample_idx})")
 
-        def on_apply_steering(
-            sample_idx, mode, prop,
-            uniform_alpha,
-            seg_attack, seg_body, seg_tail,
-            env_start, env_end,
-            temp_attack, temp_sustain,
-            session_state,
-        ):
-            """Apply steering and update all outputs."""
-            # Build params for current property based on mode
-            if mode == "uniform":
-                params = {"alpha": uniform_alpha}
-            elif mode == "segment":
-                params = {"alpha_attack": seg_attack, "alpha_body": seg_body, "alpha_tail": seg_tail}
-            elif mode == "envelope":
-                params = {"alpha_start": env_start, "alpha_end": env_end}
-            elif mode == "temporal_features":
-                params = {"alpha_attack": temp_attack, "alpha_sustain": temp_sustain}
-            else:
-                params = {}
-
-            # Store in state
-            for k, v in params.items():
-                session_state.set_param(prop, k, v)
-            session_state.current_mode = mode
-            session_state.current_property = prop
-
-            # Get or compute original latents
-            if session_state.z_original is None:
-                z_original = get_audio_latents(models, sample_idx)
-                session_state.z_original = z_original
-                session_state.audio_original = decode_to_audio(z_original, models)
-            else:
-                z_original = session_state.z_original
-
-            # Build property_params dict for steering
-            property_params = {prop: params}
-
-            # Apply steering
-            z_steered = multi_property_steer(models, z_original, mode, property_params)
-            audio_steered = decode_to_audio(z_steered, models)
-
-            session_state.z_steered = z_steered
-            session_state.audio_steered = audio_steered
-
-            # Add to history
-            history_item = SteeringHistoryItem(
-                sample_idx=sample_idx,
-                mode=mode,
-                property_name=prop,
-                params=params.copy(),
-                timestamp=time.time(),
-            )
-            session_state.add_to_history(history_item)
-
-            # Create visualizations
-            waveform_fig = create_waveform_overlay(session_state.audio_original, audio_steered)
-            spec_fig = create_spectrogram_comparison(session_state.audio_original, audio_steered)
-            env_fig = create_alpha_envelope(mode, params, prop)
-
-            # Format data readout
-            alpha_str = format_alpha_display(params, mode)
-            max_corr = models["control_vectors"].get(prop, {}).get("max_corr", 0)
-            data_md = (
-                f"**PROPERTY:** {prop.upper()}\n\n"
-                f"**MODE:** {mode.upper()}\n\n"
-                f"**ALPHA:** `{alpha_str}`\n\n"
-                f"**MAX |r|:** {max_corr:.3f}"
-            )
-
-            # Format history
-            history_lines = []
-            for i, h in enumerate(session_state.steering_history[:5]):
-                history_lines.append(f"{i+1}. {h.property_name}: {h.summary()}")
-            history_md = "\n".join(history_lines) if history_lines else "*No history*"
-
-            # Audio output (show steered)
-            audio_out = (CONFIG.sample_rate, audio_steered) if audio_steered is not None else None
-            session_state.current_playback = "B"
-
-            active_props = get_active_properties(property_params)
-            status = f"*Steered: {', '.join(active_props)} | Mode: {mode}*"
-
-            return (
-                audio_out,
-                waveform_fig,
-                spec_fig,
-                env_fig,
-                status,
-                data_md,
-                history_md,
-                gr.update(variant="secondary"),  # A inactive
-                gr.update(variant="primary"),    # B active (now playing steered)
-                session_state,
-            )
-
-        apply_btn.click(
-            fn=on_apply_steering,
-            inputs=[
-                sample_dropdown, mode_radio, property_radio,
-                uniform_slider,
-                segment_attack, segment_body, segment_tail,
-                envelope_start, envelope_end,
-                temporal_attack, temporal_sustain,
-                state,
-            ],
-            outputs=[
-                main_audio,
-                waveform_plot,
-                spectrogram_plot,
-                envelope_plot,
-                status_text,
-                data_readout,
-                history_display,
-                ab_a_btn,
-                ab_b_btn,
-                state,
-            ],
-        )
-
-        def on_reset(session_state):
-            """Reset all sliders to default."""
-            session_state.clear_steering()
-            return (
-                CONFIG.alpha_default,  # uniform
-                CONFIG.alpha_default, CONFIG.alpha_default, CONFIG.alpha_default,  # segment
-                CONFIG.alpha_default, CONFIG.alpha_default,  # envelope
-                CONFIG.alpha_default, CONFIG.alpha_default,  # temporal
-                "*Sliders reset*",
-                session_state,
-            )
-
-        reset_btn.click(
-            fn=on_reset,
-            inputs=[state],
-            outputs=[
-                uniform_slider,
-                segment_attack, segment_body, segment_tail,
-                envelope_start, envelope_end,
-                temporal_attack, temporal_sustain,
-                status_text,
-                state,
-            ],
-        )
-
-        def on_ab_toggle_a(session_state):
-            """Switch to original audio - highlight A button."""
-            session_state.current_playback = "A"
-            audio_out = (CONFIG.sample_rate, session_state.audio_original) if session_state.audio_original is not None else None
-            return (
-                audio_out,
-                gr.update(variant="primary"),   # A active
-                gr.update(variant="secondary"), # B inactive
-                session_state,
-            )
-
-        def on_ab_toggle_b(session_state):
-            """Switch to steered audio - highlight B button."""
-            session_state.current_playback = "B"
-            audio_out = (CONFIG.sample_rate, session_state.audio_steered) if session_state.audio_steered is not None else None
-            return (
-                audio_out,
-                gr.update(variant="secondary"), # A inactive
-                gr.update(variant="primary"),   # B active
-                session_state,
-            )
-
-        ab_a_btn.click(fn=on_ab_toggle_a, inputs=[state], outputs=[main_audio, ab_a_btn, ab_b_btn, state])
-        ab_b_btn.click(fn=on_ab_toggle_b, inputs=[state], outputs=[main_audio, ab_a_btn, ab_b_btn, state])
-
-        def on_save(
-            sample_idx, mode, prop,
-            uniform_alpha,
-            seg_attack, seg_body, seg_tail,
-            env_start, env_end,
-            temp_attack, temp_sustain,
-            session_state,
-        ):
-            """Save comprehensive experiment data: audio, metadata, plots."""
-            import json
-            from datetime import datetime
-
-            # Create timestamped experiment folder
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            exp_name = f"exp_{timestamp}_sample{sample_idx:04d}_{prop}_{mode}"
-            exp_dir = PROJECT_ROOT / CONFIG.output_dir / exp_name
-            exp_dir.mkdir(parents=True, exist_ok=True)
-
-            # Build alpha params based on mode
-            if mode == "uniform":
-                alpha_params = {"alpha": uniform_alpha}
-            elif mode == "segment":
-                alpha_params = {"alpha_attack": seg_attack, "alpha_body": seg_body, "alpha_tail": seg_tail}
-            elif mode == "envelope":
-                alpha_params = {"alpha_start": env_start, "alpha_end": env_end}
-            elif mode == "temporal_features":
-                alpha_params = {"alpha_attack": temp_attack, "alpha_sustain": temp_sustain}
-            else:
-                alpha_params = {}
-
-            # Get feature info
-            cv = models["control_vectors"].get(prop, {})
-            top_features = cv.get("top_features", []).tolist() if hasattr(cv.get("top_features", []), "tolist") else []
-            correlations = cv.get("correlations", [])
-            top_correlations = {int(idx): float(correlations[idx]) for idx in top_features[-10:]} if len(correlations) > 0 else {}
-
-            # Build metadata
-            metadata = {
-                "timestamp": timestamp,
-                "sample_idx": int(sample_idx),
-                "property": prop,
-                "mode": mode,
-                "alphas": alpha_params,
-                "max_correlation": float(cv.get("max_corr", 0)),
-                "top_features": top_features[-10:],
-                "top_correlations": top_correlations,
-                "config": {
-                    "n_timesteps": CONFIG.n_timesteps,
-                    "attack_end": CONFIG.attack_end,
-                    "body_end": CONFIG.body_end,
-                    "sample_rate": CONFIG.sample_rate,
-                },
-                "notes": "",  # User can edit this later
-            }
-
-            # Save metadata JSON
-            with open(exp_dir / "metadata.json", "w") as f:
-                json.dump(metadata, f, indent=2)
-
-            # Save original audio
-            if session_state.audio_original is not None:
-                torchaudio.save(
-                    str(exp_dir / "original.wav"),
-                    torch.tensor(session_state.audio_original).unsqueeze(0),
-                    CONFIG.sample_rate,
+                audio_less, audio_orig, audio_more = generate_triplet(
+                    models_dict, sample_idx, property_name, strength
                 )
 
-            # Save steered audio
-            if session_state.audio_steered is not None:
-                torchaudio.save(
-                    str(exp_dir / "steered.wav"),
-                    torch.tensor(session_state.audio_steered).unsqueeze(0),
-                    CONFIG.sample_rate,
+                # Create visualizations
+                waveform_fig = create_triplet_waveform(
+                    audio_less, audio_orig, audio_more, SAMPLE_RATE, strength
+                )
+                spec_fig = create_triplet_spectrogram(
+                    audio_less, audio_orig, audio_more, SAMPLE_RATE, strength
                 )
 
-            # Save visualizations
-            try:
-                # Waveform
-                waveform_fig = create_waveform_overlay(
-                    session_state.audio_original,
-                    session_state.audio_steered,
-                )
-                waveform_fig.savefig(exp_dir / "waveform.png", dpi=150, bbox_inches="tight")
-                plt.close(waveform_fig)
+                outputs.extend([
+                    (SAMPLE_RATE, audio_less) if audio_less is not None else None,
+                    (SAMPLE_RATE, audio_orig) if audio_orig is not None else None,
+                    (SAMPLE_RATE, audio_more) if audio_more is not None else None,
+                    waveform_fig,
+                    spec_fig,
+                ])
 
-                # Spectrogram
-                spec_fig = create_spectrogram_comparison(
-                    session_state.audio_original,
-                    session_state.audio_steered,
-                )
-                spec_fig.savefig(exp_dir / "spectrogram.png", dpi=150, bbox_inches="tight")
-                plt.close(spec_fig)
+            # Pad remaining rows
+            for _ in range(3 - len(selected)):
+                outputs.extend([None, None, None, None, None])
 
-                # Alpha envelope
-                env_fig = create_alpha_envelope(mode, alpha_params, prop)
-                env_fig.savefig(exp_dir / "alpha_envelope.png", dpi=150, bbox_inches="tight")
-                plt.close(env_fig)
-            except Exception as e:
-                print(f"[WARN] Failed to save plots: {e}")
+            prop_label = get_property_label(property_name)
+            status = f"*Generated {len(selected)} triplets for **{prop_label}** at ±{strength:.1f}× strength*"
+            outputs.append(status)
 
-            return f"*Saved experiment to {exp_dir.name}/*"
+            return outputs
 
-        save_btn.click(
-            fn=on_save,
-            inputs=[
-                sample_dropdown, mode_radio, property_radio,
-                uniform_slider,
-                segment_attack, segment_body, segment_tail,
-                envelope_start, envelope_end,
-                temporal_attack, temporal_sustain,
-                state,
-            ],
-            outputs=[status_text],
+        # Build outputs list: 3 rows × 5 outputs + status
+        generate_outputs = []
+        for row in sample_outputs:
+            generate_outputs.extend([row["less"], row["orig"], row["more"], row["waveform"], row["spectrogram"]])
+        generate_outputs.append(status_text)
+
+        generate_btn.click(
+            fn=on_generate,
+            inputs=[model_dropdown, property_dropdown, strength_slider, n_samples_slider, seed_input],
+            outputs=generate_outputs,
         )
 
     return demo
@@ -867,18 +490,13 @@ def build_interface(models: dict) -> gr.Blocks:
 def main():
     """Launch the demo."""
     print("\n" + "=" * 60)
-    print("DRUMS SAE STEERING DEMO")
+    print("🔬 DRUMS SAE STEERING LAB")
     print("=" * 60)
 
-    models = load_models()
-    demo = build_interface(models)
+    demo = build_interface()
 
     print("\n[LAUNCH] Starting Gradio server...")
-    demo.launch(
-        share=False,
-        css=BRUTALIST_CSS,
-        favicon_path=str(PROJECT_ROOT / "demo" / "logos" / "favicon.ico"),
-    )
+    demo.launch(share=False)
 
 
 if __name__ == "__main__":
