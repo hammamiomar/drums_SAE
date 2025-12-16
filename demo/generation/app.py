@@ -2,49 +2,95 @@
 
 Control what the AI generates using interpretable audio features.
 
-This demo uses Sparse Autoencoders (SAEs) to steer the diffusion process
-of Stable Audio Open. Adjust sliders to influence acoustic properties,
+This demo uses Sparse Autoencoders (SAEs) to steer the generation of
+Stable Audio Open. Adjust sliders to influence acoustic properties,
 then compare steered output to an unsteered baseline (same seed).
+
+Architecture:
+    Text → Diffusion → Clean Latents → Normalize → SAE Steer → Denormalize → VAE → Audio
+
+Key insight: SAE steering is applied POST-HOC on clean latents in the
+normalized space (same space SAE was trained on).
+
+Usage:
+    # Recommended: run via module
+    DYLD_FALLBACK_LIBRARY_PATH=/usr/local/ffmpeg7/lib uv run python -m demo.generation.run
+
+    # Or direct run (this file handles path setup)
+    DYLD_FALLBACK_LIBRARY_PATH=/usr/local/ffmpeg7/lib uv run python demo/generation/app.py
 """
 
 import logging
 import random
+import sys
 from pathlib import Path
-from typing import Optional
 
 import gradio as gr
 import numpy as np
 import torch
+from einops import rearrange
 
-from drums_SAE.diffusion import generate_steered_audio, load_sae, load_stable_audio
-from drums_SAE.steering.probe_steer import ProbeSteeringVectors
+# Handle imports for both direct run and module import
+_THIS_DIR = Path(__file__).parent
+_PROJECT_ROOT = _THIS_DIR.parent.parent
 
-from .analysis import create_evolution_plot, format_comparison, measure_audio_properties
-from .presets import (
-    DEFAULT_CFG,
-    DEFAULT_SCHEDULE,
-    DEFAULT_SEED,
-    DEFAULT_STEPS,
-    PROMPT_PRESETS,
-    PROPERTIES,
-    PROPERTY_NAMES,
-    SAE_CHECKPOINT,
-    SAMPLE_RATE,
-    SLIDER_RANGE,
-    SLIDER_STEP,
-    STEERING_VECTORS_PATH,
-)
-from .tracking import create_tracking_callback, get_step_schedule
+# Add paths if running directly
+if str(_PROJECT_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT / "src"))
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+# Generation: text → latents
+from drums_SAE.generation import load_models as load_stable_audio_models, load_sae, generate_latents
+
+# Steering: SHARED module (same as VAE decode demo!)
+from drums_SAE.steering import steer_with_probe, ProbeSteeringVectors
+
+# VAE decode: SHARED module (same as VAE decode demo!)
+from drums_SAE.vae import decode_latents_to_audio, load_latent_stats, load_vae
+
+# Local imports - handle both relative and absolute
+try:
+    from .analysis import format_comparison, measure_audio_properties
+    from .presets import (
+        DEFAULT_CFG,
+        DEFAULT_SEED,
+        DEFAULT_STEPS,
+        PROMPT_PRESETS,
+        SAE_CHECKPOINT,
+        SAMPLE_RATE,
+        SLIDER_RANGE,
+        SLIDER_STEP,
+        STEERING_VECTORS_PATH,
+    )
+except ImportError:
+    # Running directly, not as module
+    from demo.generation.analysis import format_comparison, measure_audio_properties
+    from demo.generation.presets import (
+        DEFAULT_CFG,
+        DEFAULT_SEED,
+        DEFAULT_STEPS,
+        PROMPT_PRESETS,
+        SAE_CHECKPOINT,
+        SAMPLE_RATE,
+        SLIDER_RANGE,
+        SLIDER_STEP,
+        STEERING_VECTORS_PATH,
+    )
 
 logger = logging.getLogger(__name__)
 
 # === Global Model Cache ===
 # Load once at startup, reuse for all generations
 _model_cache = {
-    "model": None,
+    "model": None,           # Stable Audio diffusion model
     "model_config": None,
-    "sae": None,
-    "vectors": None,
+    "vae": None,             # VAE decoder (raw autoencoder)
+    "sample_rate": None,
+    "sae": None,             # Trained SAE
+    "vectors": None,         # Probe steering vectors
+    "latent_mean": None,     # Normalization mean
+    "latent_std": None,      # Normalization std
     "device": None,
     "loaded": False,
 }
@@ -63,16 +109,28 @@ def load_models(device: str = "mps") -> None:
         return
 
     logger.info(f"Loading models to device: {device}")
+    project_root = Path(__file__).parent.parent.parent
 
-    # Load Stable Audio Open
+    # Load Stable Audio Open (diffusion model only)
     logger.info("Loading Stable Audio Open model...")
-    model, config = load_stable_audio(device)
+    model, config, sample_rate = load_stable_audio_models(device)
     _model_cache["model"] = model
     _model_cache["model_config"] = config
+    _model_cache["sample_rate"] = sample_rate
+
+    # Load VAE using shared module (same as VAE decode demo)
+    logger.info("Loading VAE decoder...")
+    _model_cache["vae"] = load_vae(device)
+
+    # Load normalization stats (critical for correct steering!)
+    logger.info("Loading normalization statistics...")
+    latents_path = project_root / "data" / "latents_v2.npz"
+    _model_cache["latent_mean"], _model_cache["latent_std"] = load_latent_stats(
+        str(latents_path), device
+    )
 
     # Load SAE
     logger.info("Loading SAE...")
-    project_root = Path(__file__).parent.parent.parent
     sae_path = project_root / SAE_CHECKPOINT
     _model_cache["sae"] = load_sae(str(sae_path), device)
 
@@ -96,6 +154,73 @@ def get_random_seed() -> int:
     return random.randint(0, 2**31 - 1)
 
 
+def steer_and_decode(
+    latents: torch.Tensor,
+    steering: dict[str, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply steering and decode both baseline and steered audio.
+
+    This function uses the SAME steering + decode code as the VAE decode demo,
+    ensuring consistent behavior across both demos.
+
+    Args:
+        latents: Clean latents from diffusion, shape (B, C, T) = (B, 64, T)
+        steering: Dict of property_name → alpha values
+
+    Returns:
+        Tuple of (baseline_audio, steered_audio) as numpy arrays
+    """
+    sae = _model_cache["sae"]
+    vectors = _model_cache["vectors"]
+    vae = _model_cache["vae"]
+    mean = _model_cache["latent_mean"]
+    std = _model_cache["latent_std"]
+
+    B, C, T = latents.shape
+
+    # Reshape latents: (B, C, T) → (B*T, C) for SAE processing
+    z_flat = rearrange(latents, "b c t -> (b t) c")
+
+    # === NORMALIZE to SAE's training distribution ===
+    # This is critical! SAE was trained on normalized latents.
+    z_norm = (z_flat - mean) / (std + 1e-8)
+
+    # === DECODE BASELINE (no steering) ===
+    # Reshape for decode: (B*T, C) → (B, T, C)
+    z_baseline = rearrange(z_norm, "(b t) c -> b t c", b=B, t=T)
+    baseline_audio = decode_latents_to_audio(z_baseline, vae, mean, std)
+
+    # === STEER AND DECODE ===
+    if steering:
+        z_steered = z_norm.clone().float()
+
+        # Apply steering for each property using SHARED steering code
+        for prop_name, alpha in steering.items():
+            if abs(alpha) < 0.01:
+                continue
+
+            direction = vectors.get_direction(prop_name)
+            logger.debug(f"Steering {prop_name} by {alpha:+.2f}")
+
+            # steer_with_probe handles: encode → steer → RMS norm → decode + residual
+            z_steered = steer_with_probe(
+                z=z_steered,
+                sae=sae,
+                direction=direction,
+                alpha=alpha,
+                preserve_residual=True,
+            )
+
+        # Reshape for decode: (B*T, C) → (B, T, C)
+        z_steered_reshaped = rearrange(z_steered, "(b t) c -> b t c", b=B, t=T)
+        steered_audio = decode_latents_to_audio(z_steered_reshaped, vae, mean, std)
+    else:
+        # No steering - same as baseline
+        steered_audio = baseline_audio
+
+    return baseline_audio, steered_audio
+
+
 def generate_comparison(
     prompt: str,
     bass: float,
@@ -105,11 +230,16 @@ def generate_comparison(
     steps: int,
     cfg: float,
     seed: int,
-    schedule: str,
-    track_evolution: bool,
     progress: gr.Progress = gr.Progress(),
 ) -> tuple:
     """Generate baseline and steered audio for comparison.
+
+    Pipeline:
+    1. Generate clean latents from prompt (return_latents=True)
+    2. Normalize latents to SAE's training distribution
+    3. Decode baseline (no steering)
+    4. Steer latents using SAE + probe directions
+    5. Decode steered latents
 
     Args:
         prompt: Text prompt for generation
@@ -120,12 +250,10 @@ def generate_comparison(
         steps: Diffusion steps
         cfg: Classifier-free guidance scale
         seed: Random seed
-        schedule: Steering schedule ("all", "early", "middle", "late")
-        track_evolution: Whether to track property evolution
         progress: Gradio progress callback
 
     Returns:
-        Tuple of (baseline_audio, steered_audio, comparison_md, evolution_plot)
+        Tuple of (baseline_audio, steered_audio, comparison_md, status_md)
     """
     if not _model_cache["loaded"]:
         raise gr.Error("Models not loaded. Please wait for startup to complete.")
@@ -140,158 +268,42 @@ def generate_comparison(
     steering = {k: v for k, v in steering.items() if abs(v) > 0.01}
 
     device = _model_cache["device"]
-    sample_rate = _model_cache["model_config"].get("sample_rate", SAMPLE_RATE)
+    sample_rate = _model_cache["sample_rate"]
 
-    # Get step schedule
-    apply_at_steps = get_step_schedule(steps, schedule)
+    # === STEP 1: GENERATE CLEAN LATENTS ===
+    progress(0.1, desc="Generating latents from prompt...")
 
-    # Initialize data for evolution plot
-    baseline_steps = []
-    steered_steps = []
-    evolution_plot = None
+    latents = generate_latents(
+        model=_model_cache["model"],
+        prompt=prompt,
+        seconds=2.0,  # ~88200 samples at 44.1kHz
+        steps=int(steps),
+        cfg_scale=cfg,
+        seed=int(seed),
+        device=device,
+    )
+    logger.info(f"Generated latents shape: {latents.shape}")
 
-    # === GENERATE BASELINE ===
-    progress(0.05, desc="[1/2] Generating BASELINE (no steering)...")
-
-    if track_evolution:
-        # Use tracking callback for baseline (no steering)
-        baseline_callback, baseline_steps = create_tracking_callback(
-            sae=_model_cache["sae"],
-            steering_vectors=_model_cache["vectors"],
-            property_alphas=None,  # No steering
-            apply_at_steps=None,
-        )
-        baseline_audio = generate_steered_audio(
-            prompt=prompt,
-            property_steering={},  # No steering
-            steps=steps,
-            cfg_scale=cfg,
-            seed=seed,
-            device=device,
-            model=_model_cache["model"],
-            model_config=_model_cache["model_config"],
-            sae=_model_cache["sae"],
-            steering_vectors=_model_cache["vectors"],
-            callback=baseline_callback,
-        )
-    else:
-        baseline_audio = generate_steered_audio(
-            prompt=prompt,
-            property_steering={},  # No steering
-            steps=steps,
-            cfg_scale=cfg,
-            seed=seed,
-            device=device,
-            model=_model_cache["model"],
-            model_config=_model_cache["model_config"],
-        )
-
-    # === GENERATE STEERED ===
+    # === STEP 2-5: STEER AND DECODE (using shared code!) ===
     steering_desc = (
         ", ".join(f"{k}={v:+.1f}" for k, v in steering.items()) if steering else "none"
     )
-    progress(0.5, desc=f"[2/2] Generating STEERED ({steering_desc})...")
 
+    progress(0.4, desc="Decoding baseline...")
     if steering:
-        if track_evolution:
-            # Use tracking callback with steering
-            steered_callback, steered_steps = create_tracking_callback(
-                sae=_model_cache["sae"],
-                steering_vectors=_model_cache["vectors"],
-                property_alphas=steering,
-                apply_at_steps=apply_at_steps,
-            )
-            steered_audio = generate_steered_audio(
-                prompt=prompt,
-                property_steering={},  # Steering happens in callback
-                steps=steps,
-                cfg_scale=cfg,
-                seed=seed,
-                device=device,
-                model=_model_cache["model"],
-                model_config=_model_cache["model_config"],
-                sae=_model_cache["sae"],
-                steering_vectors=_model_cache["vectors"],
-                callback=steered_callback,
-            )
-        else:
-            steered_audio = generate_steered_audio(
-                prompt=prompt,
-                property_steering=steering,
-                steps=steps,
-                cfg_scale=cfg,
-                seed=seed,
-                apply_steering_at=schedule,
-                device=device,
-                model=_model_cache["model"],
-                model_config=_model_cache["model_config"],
-                sae=_model_cache["sae"],
-                steering_vectors=_model_cache["vectors"],
-            )
-    else:
-        # No steering requested, copy baseline
-        steered_audio = baseline_audio.clone()
-        steered_steps = baseline_steps.copy() if track_evolution else []
+        progress(0.6, desc=f"Steering latents ({steering_desc})...")
+
+    baseline_np, steered_np = steer_and_decode(latents, steering)
 
     # === ANALYZE RESULTS ===
     progress(0.9, desc="Analyzing and comparing results...")
 
-    # Convert to numpy and ensure mono 1D array
-    baseline_np = baseline_audio.cpu().numpy()
-    steered_np = steered_audio.cpu().numpy()
-
-    # Handle various output shapes from the model
-    # Could be (samples,), (1, samples), (2, samples), or (batch, channels, samples)
-    def to_mono_1d(arr):
-        """Convert any audio array to mono 1D."""
-        arr = arr.squeeze()  # Remove singleton dims
-        if arr.ndim == 1:
-            return arr
-        elif arr.ndim == 2:
-            # (channels, samples) -> take first channel or average
-            if arr.shape[0] <= 2:  # channels first
-                return arr[0]  # Take first channel
-            else:  # samples first (unlikely but handle it)
-                return arr[:, 0]
-        else:
-            # Flatten as last resort
-            return arr.flatten()
-
-    # Debug: log raw tensor stats before any processing
     logger.info(
-        f"RAW tensor - baseline shape: {baseline_np.shape}, min: {baseline_np.min():.4f}, max: {baseline_np.max():.4f}, std: {baseline_np.std():.4f}"
+        f"FINAL - baseline: {baseline_np.shape}, std: {baseline_np.std():.4f}"
     )
     logger.info(
-        f"RAW tensor - steered shape: {steered_np.shape}, min: {steered_np.min():.4f}, max: {steered_np.max():.4f}, std: {steered_np.std():.4f}"
+        f"FINAL - steered: {steered_np.shape}, std: {steered_np.std():.4f}"
     )
-
-    baseline_np = to_mono_1d(baseline_np)
-    steered_np = to_mono_1d(steered_np)
-
-    logger.info(
-        f"AFTER to_mono - baseline shape: {baseline_np.shape}, min: {baseline_np.min():.4f}, max: {baseline_np.max():.4f}"
-    )
-    logger.info(
-        f"AFTER to_mono - steered shape: {steered_np.shape}, min: {steered_np.min():.4f}, max: {steered_np.max():.4f}"
-    )
-
-    # Normalize to [-1, 1] range to prevent clipping issues
-    def normalize_audio(arr):
-        max_val = np.abs(arr).max()
-        if max_val > 0:
-            return arr / max_val * 0.95  # Leave some headroom
-        return arr
-
-    baseline_np = normalize_audio(baseline_np.astype(np.float32))
-    steered_np = normalize_audio(steered_np.astype(np.float32))
-
-    logger.info(
-        f"FINAL - baseline: {baseline_np.shape}, min: {baseline_np.min():.4f}, max: {baseline_np.max():.4f}, std: {baseline_np.std():.4f}"
-    )
-    logger.info(
-        f"FINAL - steered: {steered_np.shape}, min: {steered_np.min():.4f}, max: {steered_np.max():.4f}, std: {steered_np.std():.4f}"
-    )
-    logger.info(f"SAMPLE RATE: {sample_rate}, type: {type(sample_rate)}")
 
     # Measure properties
     baseline_props = measure_audio_properties(baseline_np, sample_rate)
@@ -303,25 +315,15 @@ def generate_comparison(
     if not steering:
         comparison_md = "*No steering applied — both outputs are identical.*"
 
-    # Create evolution plot if tracking
-    if track_evolution and baseline_steps and steered_steps:
-        evolution_plot = create_evolution_plot(
-            baseline_steps, steered_steps, steering, schedule
-        )
-
     progress(1.0, desc="Done!")
 
     # Status message
-    steering_str = (
-        ", ".join(f"{k}={v:+.1f}" for k, v in steering.items()) if steering else "none"
-    )
-    status_md = f"**Generation complete.** Seed: {seed}, Steering: {steering_str}"
+    status_md = f"**Generation complete.** Seed: {seed}, Steering: {steering_desc}"
 
     return (
         (sample_rate, baseline_np),
         (sample_rate, steered_np),
         comparison_md,
-        evolution_plot,
         status_md,
     )
 
@@ -337,9 +339,9 @@ def create_demo() -> gr.Blocks:
 
             **Control what the AI generates** using interpretable audio features.
 
-            This demo uses Sparse Autoencoders (SAEs) to steer the diffusion process
-            of Stable Audio Open. Adjust the sliders to influence the generated sound's
-            acoustic properties — then compare the steered output to an unsteered baseline.
+            This demo uses Sparse Autoencoders (SAEs) to steer audio generation.
+            Adjust the sliders to influence the generated sound's acoustic properties —
+            then compare the steered output to an unsteered baseline.
 
             *Same prompt + same seed = only difference is steering.*
             """
@@ -418,23 +420,6 @@ def create_demo() -> gr.Blocks:
                     label="Seed",
                     precision=0,
                 )
-                schedule = gr.Dropdown(
-                    choices=["all", "early", "middle", "late"],
-                    value=DEFAULT_SCHEDULE,
-                    label="Steering Schedule",
-                    info="When to apply steering during diffusion",
-                )
-
-        # === Evolution Tracking ===
-        with gr.Accordion("Generation Visualization", open=False):
-            track_evolution = gr.Checkbox(
-                label="Track property evolution",
-                value=False,
-                info="Shows how properties crystallize during diffusion (adds ~20% generation time)",
-            )
-            evolution_plot = gr.Plot(
-                label="Property Evolution",
-            )
 
         # === Generate Button ===
         generate_btn = gr.Button(
@@ -505,14 +490,11 @@ def create_demo() -> gr.Blocks:
                 steps,
                 cfg,
                 seed,
-                schedule,
-                track_evolution,
             ],
             outputs=[
                 baseline_audio,
                 steered_audio,
                 comparison_display,
-                evolution_plot,
                 status_text,
             ],
         )

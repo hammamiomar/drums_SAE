@@ -1,17 +1,23 @@
 """
-Steering utilities for controlling drum generation via SAE features.
+⚠️  DEPRECATED: Correlation-based steering utilities.
 
-Usage:
-    from drums_SAE.steering import ControlVectors, steer_latent, steer_with_residual
+This module uses correlation-based control vectors for steering.
+**Use probe-based steering instead** — it's superior because:
+- Probes are trained to DISCRIMINATE classes, not just correlate
+- Better directional control (learned from classification task)
+- Follows the Smule SAE paper methodology
 
-    # Control vector steering (direction-based)
-    cv = ControlVectors.from_checkpoint("checkpoints/sae_step_50000.pt", "feature_summary.csv")
-    z_steered = steer_latent(z, cv["brightness"], alpha=0.5)
+USE INSTEAD:
+    from drums_SAE.steering import steer_with_probe, ProbeSteeringVectors
 
-    # Direct feature manipulation with residual preservation (Gytis trick)
-    # Uses relative scaling: 0=suppress, 1=unchanged, 2=double, -1=invert
-    z_steered = steer_with_residual(z, sae, feature_idx=1852, scale=2.0)  # Double feature 1852
-    z_steered = steer_with_residual(z, sae, feature_idx=1852, scale=0.0)  # Suppress feature 1852
+    # Load probe-derived steering vectors
+    vectors = ProbeSteeringVectors.load("experiments/v2_main/eval/steering_vectors.npz")
+
+    # Steer with probe direction
+    z_steered = steer_with_probe(z, sae, vectors.get_direction("bass"), alpha=1.5)
+
+The `steer_with_residual` function is still useful for direct feature manipulation,
+but for property-based steering, use probe_steer.py.
 """
 
 from dataclasses import dataclass

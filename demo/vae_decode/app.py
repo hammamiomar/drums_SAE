@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 import gradio as gr
+import librosa
 import numpy as np
 import pandas as pd
 import torch
@@ -28,7 +29,8 @@ from drums_SAE.steering import (
     ProbeSteeringVectors,
     create_steered_triplet,
 )
-from demo.shared.vae import DEVICE, decode_latents_to_audio, load_latent_stats, load_vae
+# VAE utilities now in shared package location
+from drums_SAE.vae import DEVICE, decode_latents_to_audio, load_latent_stats, load_vae
 from demo.shared.viz import create_triplet_spectrogram, create_triplet_waveform
 
 
@@ -81,6 +83,127 @@ def get_property_label(prop: str) -> str:
     """Get label showing both display name and internal name."""
     display = PROPERTY_DISPLAY.get(prop, prop.replace("_", " ").title())
     return f"{display} ({prop})"
+
+
+# =============================================================================
+# Audio Measurement and Comparison
+# =============================================================================
+
+def measure_audio(audio: np.ndarray, sr: int) -> dict[str, float]:
+    """Measure acoustic properties from audio for verification.
+
+    Computes the same features our probes were trained on, allowing
+    verification that steering changes properties as expected.
+    """
+    if audio is None:
+        return {}
+
+    # Ensure mono
+    if audio.ndim > 1:
+        audio = audio.mean(axis=0)
+
+    audio = audio.astype(np.float32)
+    max_val = np.max(np.abs(audio))
+    if max_val > 0:
+        audio = audio / max_val
+
+    # Spectral centroid (brightness)
+    centroid = float(np.mean(librosa.feature.spectral_centroid(y=audio, sr=sr)))
+
+    # RMS energy
+    rms = float(np.mean(librosa.feature.rms(y=audio)))
+
+    # Bass energy (< 200 Hz)
+    stft = np.abs(librosa.stft(audio))
+    freqs = librosa.fft_frequencies(sr=sr)
+    bass_mask = freqs < 200
+    bass = float(np.mean(stft[bass_mask, :])) if bass_mask.any() else 0.0
+
+    # Crest factor
+    peak = np.max(np.abs(audio))
+    crest = float(peak / (rms + 1e-8))
+
+    return {
+        "spectral_centroid": centroid,
+        "rms": rms,
+        "bass": bass,
+        "crest_factor": crest,
+    }
+
+
+def format_triplet_comparison(
+    less: dict[str, float],
+    orig: dict[str, float],
+    more: dict[str, float],
+    property_steered: str,
+    strength: float,
+) -> str:
+    """Format a markdown table comparing LESS / ORIGINAL / MORE triplet.
+
+    Args:
+        less: Measured properties of LESS audio (-strength)
+        orig: Measured properties of ORIGINAL audio
+        more: Measured properties of MORE audio (+strength)
+        property_steered: Which property was steered
+        strength: Steering strength applied
+
+    Returns:
+        Markdown table string
+    """
+    lines = [
+        f"### Verification: Steering `{property_steered}` at ±{strength:.1f}",
+        "",
+        "| Property | LESS | ORIGINAL | MORE | Less→More |",
+        "|----------|------|----------|------|-----------|",
+    ]
+
+    props_to_show = ["spectral_centroid", "rms", "bass", "crest_factor"]
+    names = {
+        "spectral_centroid": "Brightness",
+        "rms": "Loudness",
+        "bass": "Bass",
+        "crest_factor": "Punchiness",
+    }
+
+    for prop in props_to_show:
+        l = less.get(prop, 0)
+        o = orig.get(prop, 0)
+        m = more.get(prop, 0)
+        name = names.get(prop, prop)
+
+        # Is this the steered property?
+        is_steered = prop == property_steered or (
+            property_steered == "brightness" and prop == "spectral_centroid"
+        ) or (
+            property_steered == "loudness" and prop == "rms"
+        )
+        marker = " ⬅" if is_steered else ""
+
+        # Calculate less→more change
+        if abs(o) > 1e-8:
+            pct = ((m - l) / abs(o)) * 100
+            direction = "+" if pct > 0 else ""
+            change_str = f"{direction}{pct:.0f}%"
+        else:
+            change_str = "N/A"
+
+        # Format values
+        if prop == "spectral_centroid":
+            l_str = f"{l:.0f} Hz"
+            o_str = f"{o:.0f} Hz"
+            m_str = f"{m:.0f} Hz"
+        elif prop in ("rms", "bass"):
+            l_str = f"{l:.4f}"
+            o_str = f"{o:.4f}"
+            m_str = f"{m:.4f}"
+        else:
+            l_str = f"{l:.2f}"
+            o_str = f"{o:.2f}"
+            m_str = f"{m:.2f}"
+
+        lines.append(f"| {name}{marker} | {l_str} | {o_str} | {m_str} | {change_str} |")
+
+    return "\n".join(lines)
 
 
 # =============================================================================
@@ -363,6 +486,8 @@ def build_interface() -> gr.Blocks:
                 with gr.Row():
                     waveform_plot = gr.Plot(label="Waveform Comparison")
                     spectrogram_plot = gr.Plot(label="Spectrogram Comparison")
+                # Comparison table showing what changed
+                comparison_md = gr.Markdown("*Generate to see measured changes*")
 
             sample_outputs.append({
                 "less": less_audio,
@@ -370,6 +495,7 @@ def build_interface() -> gr.Blocks:
                 "more": more_audio,
                 "waveform": waveform_plot,
                 "spectrogram": spectrogram_plot,
+                "comparison": comparison_md,
             })
 
         # =====================================================================
@@ -411,13 +537,13 @@ def build_interface() -> gr.Blocks:
             print(f"\n[GEN] property={property_name}, strength={strength}, n_samples_raw={n_samples} (type={type(n_samples).__name__}), seed={seed}")
 
             if models_dict is None:
-                empty_outputs = [None] * 15 + ["*No model loaded*"]
+                empty_outputs = [None] * 18 + ["*No model loaded*"]
                 return empty_outputs
 
             if property_name is None or property_name not in models_dict["steering"].properties:
                 print(f"  [ERROR] Invalid property: {property_name}")
                 print(f"  Available: {models_dict['steering'].properties}")
-                empty_outputs = [None] * 15 + [f"*Invalid property: {property_name}*"]
+                empty_outputs = [None] * 18 + [f"*Invalid property: {property_name}*"]
                 return empty_outputs
 
             n_samples = int(min(n_samples, 3))
@@ -450,17 +576,33 @@ def build_interface() -> gr.Blocks:
                     audio_less, audio_orig, audio_more, SAMPLE_RATE, strength
                 )
 
+                # Measure audio properties and create comparison table
+                less_props = measure_audio(audio_less, SAMPLE_RATE)
+                orig_props = measure_audio(audio_orig, SAMPLE_RATE)
+                more_props = measure_audio(audio_more, SAMPLE_RATE)
+
+                comparison_table = format_triplet_comparison(
+                    less_props, orig_props, more_props,
+                    property_name, strength
+                )
+
+                # Print to console for verification
+                print(f"    LESS centroid={less_props.get('spectral_centroid', 0):.0f} Hz")
+                print(f"    ORIG centroid={orig_props.get('spectral_centroid', 0):.0f} Hz")
+                print(f"    MORE centroid={more_props.get('spectral_centroid', 0):.0f} Hz")
+
                 outputs.extend([
                     (SAMPLE_RATE, audio_less) if audio_less is not None else None,
                     (SAMPLE_RATE, audio_orig) if audio_orig is not None else None,
                     (SAMPLE_RATE, audio_more) if audio_more is not None else None,
                     waveform_fig,
                     spec_fig,
+                    comparison_table,
                 ])
 
             # Pad remaining rows
             for _ in range(3 - len(selected)):
-                outputs.extend([None, None, None, None, None])
+                outputs.extend([None, None, None, None, None, "*No sample*"])
 
             prop_label = get_property_label(property_name)
             status = f"*Generated {len(selected)} triplets for **{prop_label}** at ±{strength:.1f}× strength*"
@@ -468,10 +610,13 @@ def build_interface() -> gr.Blocks:
 
             return outputs
 
-        # Build outputs list: 3 rows × 5 outputs + status
+        # Build outputs list: 3 rows × 6 outputs + status
         generate_outputs = []
         for row in sample_outputs:
-            generate_outputs.extend([row["less"], row["orig"], row["more"], row["waveform"], row["spectrogram"]])
+            generate_outputs.extend([
+                row["less"], row["orig"], row["more"],
+                row["waveform"], row["spectrogram"], row["comparison"]
+            ])
         generate_outputs.append(status_text)
 
         generate_btn.click(

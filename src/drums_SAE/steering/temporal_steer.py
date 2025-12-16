@@ -1,9 +1,21 @@
 """
-Temporal Steering Module
-========================
+🔬 EXPERIMENTAL: Temporal Steering Module
+==========================================
 
-Core steering logic for the Drums SAE demo.
-Implements 4 temporal steering modes with clean interfaces.
+Time-varying steering for fine-grained control over drum transients.
+
+**NOT YET INTEGRATED** into active demos. Provides infrastructure for:
+- UNIFORM: Same alpha across all timesteps
+- SEGMENT: Different alpha for attack/body/tail phases
+- ENVELOPE: Smooth linear interpolation over time
+- TEMPORAL_FEATURES: Separate directions for attack vs sustain
+
+This is research code for exploring temporal control. For basic steering,
+use `drums_SAE.steering.probe_steer` instead:
+
+    from drums_SAE.steering import steer_with_probe, ProbeSteeringVectors
+
+    z_steered = steer_with_probe(z, sae, direction, alpha)
 """
 
 from dataclasses import dataclass
