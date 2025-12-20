@@ -117,6 +117,13 @@ def create_steering_callback(
         sigma = callback_info.get("sigma", "N/A")
         if isinstance(sigma, torch.Tensor):
             sigma = sigma.item()
+
+        # Log first steering step with debug info
+        if stats["steered"] == 1:
+            x_dbg = callback_info["x"]
+            logger.debug(f"First steering callback: step={step_idx}, sigma={sigma:.4f}")
+            logger.debug(f"  x: device={x_dbg.device}, dtype={x_dbg.dtype}, std={x_dbg.std().item():.4f}")
+            logger.debug(f"  SAE: device={device}, dtype={sae_dtype}")
         logger.debug(f"Steering step {step_idx}, sigma={sigma:.4f}")
 
         # Get the tensor to steer
@@ -154,6 +161,11 @@ def create_steering_callback(
         x_steered = rearrange(
             x_steered_flat, "(b t) c -> b c t", b=batch_size, t=time_steps
         )
+
+        # Log steering effect on first step
+        if stats["steered"] == 1:
+            diff = (x - x_steered).abs().max().item()
+            logger.debug(f"  Steering effect: max_diff={diff:.6f}, dir_norm={combined_direction.norm().item():.4f}")
 
         # CRITICAL: Modify x in-place to affect next diffusion step
         # This works because the sampling loop holds a reference to this tensor
